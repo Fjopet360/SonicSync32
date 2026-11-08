@@ -6,4 +6,7 @@ build_log.txt
 build_err.txt
 pio_log.txt
 pio_err.txt
+flash_log.txt
+flash_err.txt
+serial_*.txt
 compile_commands.json

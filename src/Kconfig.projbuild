@@ -66,11 +66,12 @@ menu "SonicSync32 Configuration"
             stable levels; smaller blocks react faster.
 
     config SONICSYNC_NOISE_GATE_DB
-        int "Noise gate threshold (dB)"
+        int "Noise gate threshold (dBFS RMS)"
         range -90 0
         default -50
         help
-            Level below this is treated as silence and forces the
+            Band RMS level relative to full-scale PCM. Level below
+            this is treated as silence and forces the
             corresponding LED channel to zero. Tune so that room
             noise stays below the gate.
 
@@ -102,8 +103,8 @@ menu "SonicSync32 Configuration"
         range 10 400
         default 180
         help
-            Perceptual brightness curve exponent. >100 brightens
-            mid levels for a more responsive look.
+            Brightness curve exponent. >100 reduces mid-level duty;
+            <100 increases it. 100 gives a linear mapping.
 
     config SONICSYNC_ATTACK_MS
         int "Envelope attack time (ms)"

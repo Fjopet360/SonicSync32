@@ -17,9 +17,8 @@ the light follows the music.
 
 - **ESP-IDF 6.0.1 on ESP32-C6** — RISC-V, 160 MHz single core; built with
   PlatformIO.
-- **I2S master capture** — 24-bit Philips format, 32-bit slots (64 BCLK per
-  frame, the ratio the INMP441 is designed around), left channel only,
-  DMA-driven at 16 kHz.
+- **I2S master capture** — the mic's 24-bit Philips payload is received in
+  32-bit words/slots (64 BCLK per frame), mono left, DMA-driven at 16 kHz.
 - **Self-contained FFT DSP** — in-place radix-2 Cooley–Tukey FFT with Hann
   windowing in plain C; zero external DSP libraries.
 - **Noise gate with hysteresis** — silence keeps both LEDs fully dark, and
@@ -47,9 +46,12 @@ INMP441 ──I2S──▶ DMA ──▶ 512-sample blocks (32 ms @ 16 kHz)
 ```
 
 **Capture.** The ESP32-C6 acts as I2S master and clocks the microphone
-directly: 24-bit Philips format in 32-bit slots yields 64 BCLK ticks per
-frame — the ratio the INMP441 expects — and the driver's slot mask keeps only
-the left channel (the mic's L/R pin is tied to GND). Sampling at 16 kHz gives
+directly: 32-bit RX words in 32-bit slots yield 64 BCLK ticks per
+frame. `MONO` + `LEFT` keeps the mic's left channel (L/R tied to GND).
+The signed 24-bit payload occupies bits 31:8; the low eight bits are discarded.
+On ESP32-C6, 24-bit RX uses packed 3-byte samples and stereo RX includes both
+slots regardless of the mask, so neither matches an array of mono `int32_t`
+samples. Sampling at 16 kHz gives
 a 0–8 kHz analysis range, comfortably covering both bands at a fraction of the
 CPU and DMA load of 44.1 kHz. A DMA ring buffer decouples the peripheral from
 processing.
@@ -61,12 +63,15 @@ operations per frame, negligible for the C6. The bin width is 31.25 Hz, so
 the default bands map to FFT bins 1–8 (bass, 40–250 Hz) and 10–109 (voice,
 300–3400 Hz).
 
-**Levels and gating.** Band energy (sum of squared magnitudes) is normalized
-to a dB level. Each band has its own noise gate with hysteresis: the level
+**Levels and gating.** Signed PCM is divided by 8388608 before the FFT,
+giving samples in [-1, 1). One-sided band energy is converted to RMS power
+using `2 * energy / (FFT_size * sum(Hann_window_squared))`, then to dBFS.
+A full-scale sine is approximately -3.01 dBFS RMS. Each band has its own
+noise gate with hysteresis: the level
 must exceed `gate + hysteresis` to switch on and fall below the gate to
-switch off, so room noise cannot keep the lights glowing and borderline
-levels cannot flicker them. Below the gate the envelope target is clamped to
-silence, guaranteeing both LEDs are fully off in a quiet room.
+switch off. Background noise below the chosen threshold is suppressed;
+the threshold still needs to suit the room. A closed gate immediately forces
+its PWM duty to zero, overriding any residual smoothed envelope.
 
 **Smoothing and mapping.** The gated level feeds attack/release exponential
 envelopes (60 ms up / 300 ms down by default). The smoothed level maps to a
@@ -102,7 +107,9 @@ console.
 - Every 32 ms the FFT block is processed and the green/blue LED duties are
   updated (~31 updates/s).
 - **Silence keeps both LEDs off.** Noise-gated levels below the threshold
-  always map to duty 0.
+  always force duty 0, including on the first quiet block after music.
+- Capture errors or timeouts clear both outputs and reset the gate/envelope
+  states. Reads have a finite timeout based on block duration.
 - Music drives each channel independently from its own band, smoothing and
   gate state, so bass drops and vocal passages are visible on their own
   channel.
@@ -156,7 +163,7 @@ under **SonicSync32 Configuration**. Defaults:
 | Bass band                     | 40–250 Hz | Blue channel band |
 | Voice band                    | 300–3400 Hz | Green channel band |
 | FFT size                      | 512     | Block length (power of two) |
-| Noise gate                    | −50 dB  | Silence threshold |
+| Noise gate                    | −50 dBFS RMS | Band silence threshold |
 | Gate hysteresis               | 3 dB    | Anti-flicker |
 | Span (gate → full brightness) | 38 dB   | Dynamic range |
 | Sensitivity                   | 100 %   | Brightness multiplier |
@@ -170,9 +177,10 @@ Persistent overrides can also go in `sdkconfig.defaults.esp32c6`.
 
 ### Tuning tips
 
-- Set `Component config → Log output → Default log verbosity` to `Debug`
-  (`pio run -t menuconfig`) to see per-second bass/voice levels and LED
-  duties on the console — handy for setting the noise gate.
+- At the default Info log level, the console prints bass/voice levels in
+  dBFS, gate states and green/blue PWM duties about once per second. Use
+  these measurements to set the noise gate; startup blinks alone do not
+  verify the audio path.
 - If LEDs never light, lower the gate (more negative) and/or raise
   sensitivity. If they flicker on room noise, raise the gate.
 - If bass reaction is weak, verify the audio actually contains bass; the
@@ -237,7 +245,61 @@ pio device monitor -p COMx -b 115200
 
 ## Verification status
 
-### Observed on hardware (esptool + serial console)
+### Software correction: both LEDs stay on after readiness
+
+The original firmware shifted the PCM words but did not divide the signed
+24-bit counts by full scale. That inflated levels by about 138.47 dB and
+caused ordinary microphone noise to open both gates and saturate brightness.
+The original C6 I2S format also mismatched the `int32_t` mono sample buffer.
+Both are corrected; the readiness animation and GPIO assignments are unchanged.
+
+Host regression tests compile the real `src/main.c` against simulated I2S
+and LEDC peripherals. On the original code, quiet nonzero test noise produces
+`green=4095 blue=4095`; the corrected code produces `green=0 blue=0`.
+
+| Host check | Result |
+|------------|--------|
+| Digital silence, quiet noise and DC offset | PASS — both duties 0 |
+| 125 Hz tone | PASS — blue only; quieter tone gives lower duty |
+| 1000 Hz tone, including partial I2S reads | PASS — green only |
+| Mixed tones followed by quiet input | PASS — both on, then both off on the next block |
+| Gate opening/closing hysteresis | PASS — -47/-50 dBFS at defaults |
+| Capture timeout/empty read | PASS — PWM, gates and envelopes reset |
+| RX configuration | PASS — 32-bit mono left, 32-bit slots |
+| Readiness animation | PASS — 18 flashes, no overlap, 5.4 seconds, ends off |
+
+Run with Python 3 and a GCC/Clang C11 compiler:
+
+```bash
+python3 tests/run_host_tests.py
+```
+
+These are simulated-input software results, verified locally on this machine
+(Windows, Clang 18, Python 3; UBSan omitted because its Windows runtime needs
+extra CRT libraries, compile flags otherwise identical). On-board measurements
+follow below.
+
+I2S references: [ESP-IDF 6.0.1 ESP32-C6 RX format](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c6/api-reference/peripherals/i2s.html#std-rx-mode)
+and [INMP441 data interface](https://invensense.tdk.com/wp-content/uploads/2015/02/INMP441.pdf).
+
+### Corrected firmware observations on hardware (serial console)
+
+Measured on the project's ESP32-C6 (CH343 bridge, COM6) with the corrected
+firmware; levels are the per-second console values in dBFS.
+
+| Check | Result |
+|-------|--------|
+| Build + flash | **PASS** — `firmware.bin` 211,408 bytes, hash verified by esptool |
+| Cold boot → readiness animation → READY | **PASS** — animation 5.42 s (log timestamps 302 ms → 5722 ms), ends with both duties 0 |
+| Level scaling | Corrected — ambient input now reads −22.5 to −55.4 dBFS (was inflated ~138 dB by raw PCM counts) |
+| Stuck-LEDs symptom | Gone — duties track measured levels and gate states; outputs are no longer pinned at maximum |
+| Quiet input → green=0 blue=0 | Not achieved in this room — ambient bass-band noise at the mic (−22.5 to −51.8 dBFS) exceeds the −50 dBFS gate, so blue responds to real acoustic noise (duty 0–1896); green stayed 0 |
+| Bass audio → blue responds | Blue follows bass-band energy proportionally (observed duties 0–1896 tracking −22.5 to −51.8 dBFS). A 125 Hz PC-speaker tone added no clear delta above ambient (speaker bass rolloff) |
+| Voice audio → green responds | Partial — a 1 kHz PC-speaker tone lifted the voice band from ≈ −52.4 to ≈ −48.9 dBFS and opened the gate briefly (green duties 17 and 1). Speaker level at the mic is too low to hold the gate open; a louder/closer source is needed for a full check |
+| Audio stops → outputs return to zero | **PASS for green** — voice band fell back below the gate and green returned to 0 after the tone. Blue returns to 0 whenever ambient bass drops below the gate, then re-opens on ambient noise |
+
+
+### Original firmware observations (before this correction)
 
 | Check | Result |
 |-------|--------|
@@ -246,19 +308,23 @@ pio device monitor -p COMx -b 115200
 | Flash + verify | **PASS** — image hash verified by esptool |
 | Cold boot: init → readiness animation → READY | **PASS** — confirmed in serial log |
 | Readiness animation duration | 5.4 s measured from log timestamps (302 ms → 5712 ms; 3 rounds × 6 blinks × 300 ms) |
-| Music-detection transition | **PASS** — "Music detected -> audio-reactive lighting active" logged |
-| Silence → LEDs-off transition | Not yet observed on hardware |
+| Music-detection transition | Logged immediately after READY; normalization/format defects meant this did not prove valid music detection |
+| Silence → LEDs-off transition | Failed in user observation — both external LEDs stayed on after readiness |
 | Space-free build via `pio.ps1` junction | **PASS** — no whitespace error |
 
 ### Awaiting physical confirmation
 
 | Check | Status |
 |-------|--------|
-| Readiness blink pattern seen on the LEDs | Pending — PWM duty activity verified via serial logs only |
+| Readiness blink pattern seen on the LEDs | User confirmed the startup blinks on the original firmware; the corrected build keeps the identical animation (verified in host tests and boot-log timing) |
 | LED brightness visually following music | Pending |
 | Full-power 20 W LED run at 12 V | Pending — LED driver board and current limiting to be verified first |
 
-## Serial output on boot (observed)
+## Serial output on boot
+
+### Original firmware (before correction)
+
+Historical capture.
 
 ```
 I (262) SonicSync32: === SonicSync32 boot (ESP32-C6 + INMP441 I2S) ===
@@ -274,6 +340,30 @@ I (5722) SonicSync32: READY: audio capture active, waiting for music
 I (5742) SonicSync32: Music detected -> audio-reactive lighting active
 ```
 
+### Corrected firmware (on-board capture)
+
+```
+I (262) SonicSync32: === SonicSync32 boot (ESP32-C6 + INMP441 I2S) ===
+I (272) SonicSync32: Gate -50 dBFS (+3 dB hysteresis), span 38 dB, sensitivity 100%, gamma 1.80, max brightness 4095
+I (282) SonicSync32: FFT block 512 samples, sample rate 16000 Hz
+I (282) SonicSync32: LEDs: green=GPIO18 blue=GPIO19, PWM 1000 Hz, 12-bit
+I (292) SonicSync32: I2S: BCLK=GPIO6 WS=GPIO7 SD=GPIO10, 16000 Hz, 32-bit RX words (24-bit mic), mono left
+I (302) SonicSync32: Initialization OK — running one-time readiness animation
+I (312) SonicSync32: Readiness animation: green x3, blue x3, 3 rounds, 150 ms on/off, brightness 1023
+I (5722) SonicSync32: Bands: bass 40-250 Hz (bins 1-8), voice 300-3400 Hz (bins 10-109)
+I (5722) SonicSync32: Envelope: attack 60 ms, release 300 ms (coefs 0.413/0.101)
+I (5732) SonicSync32: READY: audio capture active, waiting for music
+```
+
+Once per second the corrected firmware also prints measured band levels and
+PWM duties, e.g.:
+
+```
+I (10522) SonicSync32: bass  -34.8 dBFS on | voice  -49.3 dBFS off | green    0 blue  409
+I (16472) SonicSync32: bass  -52.1 dBFS off | voice  -52.2 dBFS off | green    0 blue    0
+```
+
+
 ## Project layout
 
 ```
@@ -284,6 +374,7 @@ SonicSync32/
 ├── sdkconfig.defaults.esp32c6  # ESP32-C6 board defaults
 ├── pio.ps1                     # PowerShell helper for spaced checkout paths
 ├── README.md
+├── tests/                      # host regression harness for the real main.c
 └── src/
     ├── CMakeLists.txt          # component build (I2S + LEDC drivers)
     ├── Kconfig.projbuild       # tunable options exposed via menuconfig

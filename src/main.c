@@ -77,6 +77,13 @@ static const char *TAG = "SonicSync32";
 /* 12-bit LEDC resolution: duty range 0..4095 */
 #define LED_DUTY_MAX 4095
 
+/* Three audio blocks plus scheduling margin; i2s_channel_read takes ms. */
+#define AUDIO_READ_TIMEOUT_MS \
+    (3U * ((1000U * CFG_FFT_N + CFG_SAMPLE_RATE - 1U) / CFG_SAMPLE_RATE) + 50U)
+
+/* Signed 24-bit PCM occupies the high 24 bits of each 32-bit RX word. */
+#define PCM24_FULL_SCALE 8388608.0f
+
 /* ------------------------------------------------------------------------- */
 /* LED channels                                                              */
 /* ------------------------------------------------------------------------- */
@@ -191,6 +198,7 @@ static int32_t s_raw[CFG_FFT_N];   /* 24-bit I2S samples (in 32-bit words) */
 static float   s_re[CFG_FFT_N];
 static float   s_im[CFG_FFT_N];
 static float   s_win[CFG_FFT_N];
+static float   s_window_power;
 
 static float s_env_bass_db  = -120.0f;   /* smoothed level envelopes (dB) */
 static float s_env_voice_db = -120.0f;
@@ -211,8 +219,8 @@ static uint32_t s_block_count;          /* for periodic debug logging */
 /* ------------------------------------------------------------------------- */
 static esp_err_t i2s_mic_init(void)
 {
-    ESP_LOGI(TAG, "I2S: BCLK=GPIO%d WS=GPIO%d SD=GPIO%d, %d Hz, 24-bit, "
-             "left channel only",
+    ESP_LOGI(TAG, "I2S: BCLK=GPIO%d WS=GPIO%d SD=GPIO%d, %d Hz, "
+             "32-bit RX words (24-bit mic), mono left",
              CFG_BCLK_GPIO, CFG_WS_GPIO, CFG_DATA_GPIO, CFG_SAMPLE_RATE);
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0,
@@ -227,9 +235,12 @@ static esp_err_t i2s_mic_init(void)
     }
 
     /*
-     * 32-bit slots in stereo format give 64 BCLK ticks per frame, which is
-     * the ratio the INMP441 expects. Only the left slot (WS low) is captured
-     * into DMA, so each sample occupies one 32-bit word.
+     * Two 32-bit slots on the wire give 64 BCLK ticks per frame, which is
+     * the ratio the INMP441 expects. On the C6, use MONO + LEFT to discard
+     * the unused right slot; stereo RX includes both slots regardless of
+     * slot_mask. Receive 32 bits so DMA matches int32_t: 24-bit RX on the
+     * C6 is packed into 3-byte samples, not left-aligned int32_t words.
+     * The mic's signed 24-bit payload is in bits 31:8; discard bits 7:0.
      */
     i2s_std_config_t std_cfg = {
         .clk_cfg = {
@@ -240,9 +251,9 @@ static esp_err_t i2s_mic_init(void)
             .bclk_div        = 8,
         },
         .slot_cfg = {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_24BIT,
+            .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
             .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT,
-            .slot_mode      = I2S_SLOT_MODE_STEREO,
+            .slot_mode      = I2S_SLOT_MODE_MONO,
             .slot_mask      = I2S_STD_SLOT_LEFT,
             .ws_width       = 32,
             .ws_pol         = false,
@@ -289,7 +300,7 @@ static int read_audio_block(void)
         esp_err_t err = i2s_channel_read(s_rx_chan,
                                          (uint8_t *)s_raw + total,
                                          sizeof(s_raw) - total,
-                                         &got, portMAX_DELAY);
+                                         &got, AUDIO_READ_TIMEOUT_MS);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "i2s_channel_read failed: %s", esp_err_to_name(err));
             return -1;
@@ -345,9 +356,11 @@ static void fft_c(float *re, float *im, int n)
 
 static void window_init(void)
 {
+    s_window_power = 0.0f;
     for (int i = 0; i < CFG_FFT_N; i++) {
         s_win[i] = 0.5f * (1.0f - cosf(2.0f * FFT_PI * (float)i /
                                        (float)(CFG_FFT_N - 1)));
+        s_window_power += s_win[i] * s_win[i];
     }
 }
 
@@ -412,10 +425,10 @@ static float band_energy(int lo, int hi)
     return e;
 }
 
-/* Normalized band energy -> relative dB. */
+/* One-sided band RMS power in dBFS, correcting for FFT and Hann gain. */
 static float energy_to_db(float energy)
 {
-    float norm = energy / ((float)CFG_FFT_N * (float)CFG_FFT_N);
+    float norm = 2.0f * energy / ((float)CFG_FFT_N * s_window_power);
     if (norm < 1e-12f) {
         norm = 1e-12f;
     }
@@ -461,24 +474,39 @@ static uint32_t map_brightness(float env_db)
 /* ------------------------------------------------------------------------- */
 /* Normal audio-reactive processing                                          */
 /* ------------------------------------------------------------------------- */
+static void reset_audio_state(void)
+{
+    s_bass_on = false;
+    s_voice_on = false;
+    s_music_on = false;
+    s_env_bass_db = -120.0f;
+    s_env_voice_db = -120.0f;
+    led_set(LED_GREEN, 0);
+    led_set(LED_BLUE, 0);
+}
+
 static void process_audio_block(void)
 {
     if (read_audio_block() != 0) {
-        /* Capture failed: keep LEDs off and retry shortly. */
-        led_set(LED_GREEN, 0);
-        led_set(LED_BLUE, 0);
+        /* No stale gate/envelope or PWM may survive a capture failure. */
+        reset_audio_state();
         vTaskDelay(pdMS_TO_TICKS(50));
         return;
     }
 
-    /* DC removal + Hann window + FFT. */
+    /*
+     * Normalize signed PCM to [-1, 1) BEFORE measuring energy in dBFS.
+     * Raw 24-bit counts inflate the old dB levels by about 138 dB, opening
+     * both noise gates and pinning both PWM outputs even on quiet input.
+     */
     float mean = 0.0f;
     for (int i = 0; i < CFG_FFT_N; i++) {
-        mean += (float)(s_raw[i] >> 8);
+        s_re[i] = (float)(s_raw[i] >> 8) / PCM24_FULL_SCALE;
+        mean += s_re[i];
     }
     mean /= (float)CFG_FFT_N;
     for (int i = 0; i < CFG_FFT_N; i++) {
-        s_re[i] = ((float)(s_raw[i] >> 8) - mean) * s_win[i];
+        s_re[i] = (s_re[i] - mean) * s_win[i];
         s_im[i] = 0.0f;
     }
     fft_c(s_re, s_im, CFG_FFT_N);
@@ -503,14 +531,15 @@ static void process_audio_block(void)
     env_update(&s_env_bass_db,  s_bass_on  ? db_bass  : -120.0f);
     env_update(&s_env_voice_db, s_voice_on ? db_voice : -120.0f);
 
-    uint32_t green = map_brightness(s_env_voice_db);
-    uint32_t blue  = map_brightness(s_env_bass_db);
+    /* A closed gate overrides smoothing immediately, including after music. */
+    uint32_t green = s_voice_on ? map_brightness(s_env_voice_db) : 0;
+    uint32_t blue  = s_bass_on  ? map_brightness(s_env_bass_db)  : 0;
     led_set(LED_GREEN, green);
     led_set(LED_BLUE, blue);
 
     s_block_count++;
     if (s_block_count % (CFG_SAMPLE_RATE / CFG_FFT_N) == 0) {
-        ESP_LOGD(TAG, "bass %6.1f dB %s | voice %6.1f dB %s | "
+        ESP_LOGI(TAG, "bass %6.1f dBFS %s | voice %6.1f dBFS %s | "
                  "green %4lu blue %4lu",
                  (double)db_bass, s_bass_on ? "on" : "off",
                  (double)db_voice, s_voice_on ? "on" : "off",
@@ -523,7 +552,7 @@ static void process_audio_block(void)
 /* ------------------------------------------------------------------------- */
 static void log_config(void)
 {
-    ESP_LOGI(TAG, "Gate %d dB (+%d dB hysteresis), span %d dB, "
+    ESP_LOGI(TAG, "Gate %d dBFS (+%d dB hysteresis), span %d dB, "
              "sensitivity %d%%, gamma %.2f, max brightness %lu",
              CFG_GATE_DB, CFG_HYST_DB, CFG_SPAN_DB,
              CFG_SENSITIVITY, (double)CFG_GAMMA / 100.0,
