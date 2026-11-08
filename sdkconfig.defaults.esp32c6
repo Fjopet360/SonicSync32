@@ -1,0 +1,4 @@
+# SonicSync32 — ESP32-C6 board defaults (merged into sdkconfig).
+# Application tuning values live in src/Kconfig.projbuild
+# ("SonicSync32 Configuration" menu).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

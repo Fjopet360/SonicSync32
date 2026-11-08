@@ -1,0 +1,9 @@
+.pio/
+sdkconfig
+sdkconfig.old
+sdkconfig.*-devkit*
+build_log.txt
+build_err.txt
+pio_log.txt
+pio_err.txt
+compile_commands.json

@@ -1,0 +1,2 @@
+# SonicSync32 — common sdkconfig defaults (all boards).
+# Board-specific defaults live in sdkconfig.defaults.esp32c6.

@@ -1,0 +1,144 @@
+# SonicSync32 application configuration.
+# All tuning values below are adjustable at build time:
+#   pio run -t menuconfig  ->  "SonicSync32 Configuration"
+menu "SonicSync32 Configuration"
+
+    config SONICSYNC_SAMPLE_RATE
+        int "I2S microphone sample rate (Hz)"
+        range 8000 48000
+        default 16000
+        help
+            Sample rate of the INMP441 I2S receive interface.
+            16000 Hz gives a 0..8 kHz analysis range and is plenty
+            for the bass (40-250 Hz) and voice (300-3400 Hz) bands.
+
+    config SONICSYNC_I2S_BCLK_GPIO
+        int "INMP441 SCK/BCLK GPIO"
+        range 0 30
+        default 6
+
+    config SONICSYNC_I2S_WS_GPIO
+        int "INMP441 WS/LRCLK GPIO"
+        range 0 30
+        default 7
+
+    config SONICSYNC_I2S_DATA_GPIO
+        int "INMP441 SD (mic data into ESP32) GPIO"
+        range 0 30
+        default 10
+
+    config SONICSYNC_LED_GREEN_GPIO
+        int "Green LED driver GPIO"
+        range 0 30
+        default 18
+
+    config SONICSYNC_LED_BLUE_GPIO
+        int "Blue LED driver GPIO"
+        range 0 30
+        default 19
+
+    config SONICSYNC_BASS_LOW_HZ
+        int "Bass band low edge (Hz)"
+        range 1 20000
+        default 40
+
+    config SONICSYNC_BASS_HIGH_HZ
+        int "Bass band high edge (Hz)"
+        range 1 20000
+        default 250
+
+    config SONICSYNC_VOICE_LOW_HZ
+        int "Voice band low edge (Hz)"
+        range 1 20000
+        default 300
+
+    config SONICSYNC_VOICE_HIGH_HZ
+        int "Voice band high edge (Hz)"
+        range 1 20000
+        default 3400
+
+    config SONICSYNC_FFT_SIZE
+        int "FFT block size (samples, power of two)"
+        range 64 1024
+        default 512
+        help
+            Larger blocks give finer frequency resolution and more
+            stable levels; smaller blocks react faster.
+
+    config SONICSYNC_NOISE_GATE_DB
+        int "Noise gate threshold (dB)"
+        range -90 0
+        default -50
+        help
+            Level below this is treated as silence and forces the
+            corresponding LED channel to zero. Tune so that room
+            noise stays below the gate.
+
+    config SONICSYNC_GATE_HYSTERESIS_DB
+        int "Noise gate hysteresis (dB)"
+        range 0 20
+        default 3
+        help
+            Level must exceed gate+hysteresis to turn on, and drop
+            below gate to turn off. Prevents flicker.
+
+    config SONICSYNC_FULL_SCALE_DB
+        int "Level span from gate to full brightness (dB)"
+        range 1 120
+        default 38
+        help
+            A channel reaches maximum brightness when its level is
+            gate + span dB. Lower values make the LEDs more lively.
+
+    config SONICSYNC_SENSITIVITY
+        int "Sensitivity (percent)"
+        range 10 500
+        default 100
+        help
+            Multiplier applied to the brightness mapping. 100 = 1x.
+
+    config SONICSYNC_GAMMA
+        int "Brightness gamma (percent, 100 = linear)"
+        range 10 400
+        default 180
+        help
+            Perceptual brightness curve exponent. >100 brightens
+            mid levels for a more responsive look.
+
+    config SONICSYNC_ATTACK_MS
+        int "Envelope attack time (ms)"
+        range 1 1000
+        default 60
+        help
+            Rise smoothing when audio gets louder.
+
+    config SONICSYNC_RELEASE_MS
+        int "Envelope release time (ms)"
+        range 1 2000
+        default 300
+        help
+            Fall smoothing when audio gets quieter.
+
+    config SONICSYNC_MAX_BRIGHTNESS
+        int "Maximum LED brightness (0-4095)"
+        range 0 4095
+        default 4095
+        help
+            Full-scale PWM duty of the 12-bit LEDC outputs.
+
+    config SONICSYNC_ANIM_BRIGHTNESS
+        int "Readiness animation brightness (0-4095)"
+        range 0 4095
+        default 1023
+        help
+            Reduced brightness used for the one-time boot readiness
+            animation (about 25% by default).
+
+    config SONICSYNC_LED_PWM_FREQ
+        int "LED PWM frequency (Hz)"
+        range 100 25000
+        default 1000
+        help
+            PWM frequency for both LED driver outputs.
+
+endmenu
