@@ -1,9 +1,14 @@
 # SonicSync32
 
-**Current candidate, based on `c436c89`: speech-gated green and bass noise-learning
-correction.** Host checks pass. Build, flash and microphone acceptance for this
-revision are pending. Earlier on-board sessions below are historical; the user
-still reports unwanted green response to high-pitched music and missed blue bass.
+**Current firmware (commit `db2a119`, speech-gated green and bass noise-learning
+correction): built, flashed, measured on the project ESP32-C6 and accepted for
+current use (on-board session 2026-11-09).** The only pending physical check
+is the full-power 20 W LED run at 12 V. Documented measured limitations remain
+in force: the VAD is not vocal separation (aggressive mode 3 reduces, but does
+not eliminate, false green on high-pitched instrumental music), the fan guard
+trades away sub-47 Hz-only bass, and a deep voice can still light blue because
+speech fundamentals sit inside the bass band. Earlier on-board sessions below
+are historical.
 
 **ESP32-C6 audio-reactive LED controller** — listens to music through an
 INMP441 I2S microphone and drives two LED channels with real-time FFT
