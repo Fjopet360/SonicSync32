@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import wave
 
 
 def main():
@@ -26,6 +27,11 @@ def main():
     parser.add_argument("--speech-probe", action="store_true", help="print speech-envelope timing response")
     parser.add_argument("--green-trace", action="store_true", help="emit deterministic green-duty trace")
     parser.add_argument("--blue-off-smoke", action="store_true", help="check blue-only diagnostic override")
+    parser.add_argument("--voice-fixture", action="store_true", help="test real VAD with upstream speech WAV")
+    parser.add_argument("--filter-smoke", action="store_true", help="test speech-filter tone rejection and error handling")
+    parser.add_argument("--blue-soft-probe", action="store_true", help="test rejected music cannot ratchet blue's gate upward")
+    parser.add_argument("--reproduce-blue-soft", action="store_true", help="expect the c436c89 soft-bass noise-learning defect")
+    parser.add_argument("--replay-wav", type=Path, help="run a mono PCM16 WAV through production detectors; emit CSV")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     compiler = shlex.split(os.environ["CC"]) if "CC" in os.environ else [
@@ -35,6 +41,10 @@ def main():
     config = (root / "src/Kconfig.projbuild").read_text()
     defaults = re.findall(r"\bconfig (\w+)\s+.*?\bdefault (-?\d+)", config, re.S)
     values = {f"CONFIG_{name}": value for name, value in defaults}
+    # Existing pure-tone tests exercise FFT/gates/brightness, not speech identity.
+    # A separate run below uses the real classifier and a speech WAV.
+    if not (args.voice_fixture or args.replay_wav or args.filter_smoke):
+        values["CONFIG_SONICSYNC_VOICE_FILTER_ENABLE"] = "0"
     for override in args.define:
         if not re.fullmatch(r"CONFIG_\w+=-?\d+", override):
             parser.error("--define expects CONFIG_NAME=integer")
@@ -56,15 +66,32 @@ def main():
             header.write_text("/* Host test: declarations are supplied by the harness. */\n")
         binary = temp / ("audio_test.exe" if os.name == "nt" else "audio_test")
         sanitizers = [] if os.name == "nt" else ["-fsanitize=undefined", "-fno-sanitize-recover=all"]
+        math_link = [] if os.name == "nt" else ["-lm"]
+        vad_dir = root / "components/voice_vad"
+        vad_sources = sorted((vad_dir / "vendor/src").rglob("*.c"))
+        vad_sources.append(vad_dir / "voice_filter.c")
         subprocess.run(compiler + ["-std=c11", "-Wall", "-Wextra", "-Werror",
                        "-Wno-unused-parameter", "-Wno-unused-function", "-O1", "-g",
-                       f"-I{temp}"] + sanitizers + defines +
-                       [str(root / "tests/host_audio_test.c"), "-lm", "-o", str(binary)],
+                       f"-I{temp}", f"-I{vad_dir}"] + sanitizers + defines +
+                       [str(root / "tests/host_audio_test.c")] +
+                       [str(p) for p in vad_sources] + math_link + ["-o", str(binary)],
                        check=True)
-        mode = (["--green-trace"] if args.green_trace else ["--blue-off-smoke"] if args.blue_off_smoke else
+        if args.voice_fixture or args.replay_wav:
+            wav_path = args.replay_wav or root / "tests/data/upstream-speech-16k.wav"
+            with wave.open(str(wav_path), "rb") as wav:
+                if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, int(values["CONFIG_SONICSYNC_SAMPLE_RATE"])):
+                    parser.error("WAV must be mono PCM16 at the configured sample rate")
+                raw_path = temp / "input.pcm"
+                raw_path.write_bytes(wav.readframes(wav.getnframes()))
+            subprocess.run([str(binary), "--voice-fixture" if args.voice_fixture else
+                            "--replay-pcm", str(raw_path)], check=True)
+            return
+        mode = (["--blue-soft-probe"] if args.blue_soft_probe else ["--reproduce-blue-soft"] if args.reproduce_blue_soft else ["--filter-smoke"] if args.filter_smoke else ["--green-trace"] if args.green_trace else ["--blue-off-smoke"] if args.blue_off_smoke else
                 ["--speech-probe"] if args.speech_probe else ["--config-smoke"] if args.config_smoke else ["--reproduce"] if args.reproduce else
                 ["--reproduce-ambient"] if args.reproduce_ambient else [])
         subprocess.run([str(binary)] + mode, check=True)
+        if not mode and not args.source:
+            subprocess.run([str(binary), "--blue-soft-probe"], check=True)
 
 
 if __name__ == "__main__":

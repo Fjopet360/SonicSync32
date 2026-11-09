@@ -11,6 +11,7 @@ typedef int esp_err_t;
 typedef int ledc_channel_t;
 typedef void *i2s_chan_handle_t;
 #define ESP_OK 0
+#define ESP_FAIL (-1)
 #define ESP_ERR_TIMEOUT 1
 #define GPIO_MODE_OUTPUT 1
 #define LEDC_LOW_SPEED_MODE 0
@@ -153,6 +154,11 @@ static esp_err_t i2s_channel_read(i2s_chan_handle_t h, void *dest,
 static void reset_fixture(void)
 {
     s_bass_on = s_voice_on = s_music_on = false;
+#ifdef CFG_VOICE_FILTER
+    s_voice_level_on = s_speech = false;
+    s_voice_tone_share = 0.0f;
+    if (CFG_VOICE_FILTER) assert(voice_filter_init(CFG_SAMPLE_RATE, CFG_VOICE_MODE));
+#endif
 #ifndef CFG_VOICE_ATTACK_MS
     s_env_bass_db = -120.0f;
 #endif
@@ -225,6 +231,108 @@ static void warm_up_quiet(void)
 
 int main(int argc, char **argv)
 {
+#ifdef CFG_VOICE_FILTER
+    if (argc == 2 && !strcmp(argv[1], "--filter-smoke")) {
+        assert(CFG_VOICE_FILTER && CFG_VOICE_TONE_MAX < 100);
+        reset_fixture();
+        warm_up_quiet();
+        const float pitches[] = {500.0f, 1000.0f, 1600.0f, 2400.0f, 3150.0f};
+        for (unsigned p = 0; p < sizeof(pitches) / sizeof(pitches[0]); p++) {
+            reset_fixture();
+            warm_up_quiet();
+            tone_hz(0.1f, pitches[p]);
+            for (int block = 0; block < 120; block++) {
+                frames(1);
+                assert(!duty[0] && !duty[1] && s_voice_tone_share > 95.0f);
+            }
+        }
+        puts("PASS: real VAD plus tone veto rejects 500/1000/1600/2400/3150 Hz tones");
+        assert(!voice_filter_init(16001, 2));
+        assert(!voice_filter_process(input_words, CFG_FFT_N));
+        assert(!voice_filter_init(16000, 4));
+        assert(!voice_filter_process(input_words, CFG_FFT_N));
+        assert(voice_filter_init(CFG_SAMPLE_RATE, CFG_VOICE_MODE));
+        puts("PASS: invalid speech rate/mode fails closed; valid initialization recovers");
+        return 0;
+    }
+    if (argc == 3 && (!strcmp(argv[1], "--voice-fixture") ||
+                      !strcmp(argv[1], "--replay-pcm"))) {
+        bool validate_voice = !strcmp(argv[1], "--voice-fixture");
+        assert(CFG_VOICE_FILTER);
+        reset_fixture();
+        warm_up_quiet();
+        FILE *pcm = fopen(argv[2], "rb");
+        assert(pcm);
+        int16_t samples[CFG_FFT_N];
+        size_t n;
+        unsigned active = 0, total = 0;
+        if (!validate_voice)
+            puts("frame,bass_db,gate_db,open_db,voice_db,speech,tone_share,green,blue");
+        while ((n = fread(samples, sizeof(*samples), CFG_FFT_N, pcm)) != 0) {
+            for (size_t i = 0; i < CFG_FFT_N; i++)
+                input_words[i] = i < n ? (int32_t)samples[i] * 65536 : 0;
+            frames(1);
+            total++;
+            if (duty[0]) active++;
+            assert(duty[1] == 0 || duty[1] == CFG_MAX_BRIGHT);
+            if (!validate_voice)
+                printf("%u,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%u,%u\n", total,
+                       energy_to_db(band_energy(s_bin_bass_lo_blue, s_bin_bass_hi)),
+                       s_bass_gate_db, s_bass_gate_db + CFG_BASS_HYST,
+                       energy_to_db(band_energy(s_bin_voice_lo, s_bin_voice_hi)),
+                       (int)s_speech, s_voice_tone_share, duty[0], duty[1]);
+        }
+        assert(!ferror(pcm));
+        fclose(pcm);
+        if (validate_voice) {
+            assert(total > 10 && active > total / 4);
+            printf("PASS: upstream speech recording lights green in %u/%u blocks\n",
+                   active, total);
+            memset(input_words, 0, sizeof(input_words));
+            frames(1);
+            assert(!duty[0] && !duty[1]);
+            read_error = true;
+            frames(1);
+            assert(!duty[0] && !duty[1] && !s_speech);
+            puts("PASS: VAD path respects immediate silence and capture-error OFF");
+        }
+        return 0;
+    }
+#endif
+#ifdef CFG_BASS_OFFSET
+    if (argc > 1 && (!strcmp(argv[1], "--blue-soft-probe") ||
+                     !strcmp(argv[1], "--reproduce-blue-soft"))) {
+        bool reproduce = !strcmp(argv[1], "--reproduce-blue-soft");
+        reset_fixture();
+        const float rms_to_peak = 1.41421356237f;
+        tones(rms_to_peak * powf(10, -38.2f / 20), 0, 0);
+        frames(BASS_CAL_FRAMES);
+        float start_floor = s_bass_noise_db;
+        float start_gate = s_bass_gate_db;
+        assert(fabsf(start_floor + 38.0f) < 0.1f);
+        tones(rms_to_peak * powf(10, -27.0f / 20), 0, 0);
+        frames(600); /* 19.2 s inside closing/opening hysteresis gap */
+        assert(!duty[1]);
+        float learned_floor = s_bass_noise_db;
+        float opening = s_bass_gate_db + CFG_BASS_HYST;
+        tones(rms_to_peak * powf(10, -23.0f / 20), 0, 0);
+        frames(2);
+        printf("Soft-bass probe: floor %.1f -> %.1f, initial gate %.1f, "
+               "opening before hit %.1f, -23 dBFS hit -> blue %u\n",
+               start_floor, learned_floor, start_gate, opening, duty[1]);
+        if (reproduce) {
+            assert(!duty[1] && learned_floor > start_floor + 5);
+            puts("REPRODUCED: rejected soft bass raises the floor and blocks a later qualifying hit");
+        } else {
+            assert(duty[1] == CFG_MAX_BRIGHT && fabsf(learned_floor - start_floor) < 0.01f);
+            quiet_noise();
+            frames(1);
+            assert(!duty[1]);
+            puts("PASS: hysteresis-gap bass is not learned as noise; stronger hit ON, silence OFF");
+        }
+        return 0;
+    }
+#endif
     if (argc > 1 && !strcmp(argv[1], "--green-trace")) {
         reset_fixture();
         const float bass_levels[] = {0, 0.003f, 0.03f, 0.1f, 0.4f};
@@ -419,14 +527,15 @@ int main(int argc, char **argv)
     for (int burst = 0; burst < 20; burst++) {
         tones(0.1f, 0, 0);
         frames(1);
-        assert(!s_bass_on && !duty[1]);
+        assert(s_bass_on && duty[1] == CFG_MAX_BRIGHT);
         quiet_noise();
         frames(1);
+        assert(!s_bass_on && !duty[1]);
     }
     tones(0.1f, 0, 0);
     frames(2);
     assert(s_bass_on && duty[1] > 0);
-    puts("PASS: isolated 32 ms spikes rejected; a 64 ms bass hit responds");
+    puts("PASS: above-threshold 32 ms bass hits respond, silence turns blue OFF");
 
     /* Blue-only low-edge guard: bin 1 (center 31.25 Hz) is skipped when its
        center sits below the configured 40 Hz edge. A sub-band tone leaks
@@ -444,7 +553,7 @@ int main(int argc, char **argv)
     quiet_noise();
     frames(1);
     assert(!s_bass_on && !duty[1]);
-    puts("PASS: sub-band 31.25 Hz bin cannot gate blue; equal-level 125 Hz bass opens it");
+    puts("PASS: tested 31.25 Hz rumble stays OFF; equal-level 125 Hz bass opens blue");
 
     reset_fixture();
     warm_up_quiet();
@@ -581,7 +690,7 @@ int main(int argc, char **argv)
     for (unsigned hit = 0; hit < sizeof(hits) / sizeof(hits[0]); hit++) {
         tones(hits[hit], 0, 0);
         frames(1);
-        assert(!duty[1]);
+        assert(duty[1] == CFG_MAX_BRIGHT);
         frames(1);
         assert(duty[1] == CFG_MAX_BRIGHT);
         frames(2);

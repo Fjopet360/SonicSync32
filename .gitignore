@@ -10,3 +10,6 @@ flash_log.txt
 flash_err.txt
 serial_*.txt
 compile_commands.json
+.sonicsync-captures/
+__pycache__/
+*.pyc

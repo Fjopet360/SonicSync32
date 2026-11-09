@@ -1,16 +1,24 @@
 # SonicSync32
 
+**Current candidate, based on `c436c89`: speech-gated green and bass noise-learning
+correction.** Host checks pass. Build, flash and microphone acceptance for this
+revision are pending. Earlier on-board sessions below are historical; the user
+still reports unwanted green response to high-pitched music and missed blue bass.
+
 **ESP32-C6 audio-reactive LED controller** — listens to music through an
 INMP441 I2S microphone and drives two LED channels with real-time FFT
 frequency analysis.
 
 | LED channel | Reacts to                     |
 |-------------|-------------------------------|
-| **Green**   | Fast, graduated response to voice-range energy (300–3400 Hz) |
-| **Blue**    | Binary bass indicator (40–250 Hz): OFF or configured maximum |
+| **Green**   | Speech activity plus voice-band energy (300–3400 Hz), graduated brightness |
+| **Blue**    | Binary bass indicator: configured 40–250 Hz, selected default bin centers 62.5–250 Hz |
 
-This is frequency-reactive lighting, not speech recognition. Green follows
-speech-band level and articulation; other sounds in that band can trigger it.
+Green now requires WebRTC/libfvad speech activity and voice-band energy.
+A narrow-tone veto rejects frames when three adjacent voice-band FFT bins
+hold at least 95% of that band's energy. This rejects nearly pure tones
+that VAD can accept as speech. It is not vocal separation: singing and
+some instruments can still pass, and some speech can be rejected.
 Blue switches on when bass passes its background-aware gate and switches off
 when the gate closes. Sustained bass holds blue on; it is not a timed strobe.
 
@@ -21,7 +29,9 @@ when the gate closes. Sustained bass holds blue on; it is not a timed strobe.
 - **I2S master capture** — the mic's 24-bit Philips payload is received in
   32-bit words/slots (64 BCLK per frame), mono left, DMA-driven at 16 kHz.
 - **Self-contained FFT DSP** — in-place radix-2 Cooley–Tukey FFT with Hann
-  windowing in plain C; zero external DSP libraries.
+  windowing in plain C. A vendored BSD-licensed WebRTC/libfvad component
+  classifies consecutive 10 ms PCM16 frames, carrying incomplete frames
+  across FFT blocks. Attribution is in `components/voice_vad/UPSTREAM.md`.
 - **Noise gate with hysteresis** — silence keeps both LEDs fully dark, and
   hysteresis stops flicker at the threshold.
 - **Independent channel response** — blue uses a higher, background-aware
@@ -49,7 +59,9 @@ when the gate closes. Sustained bass holds blue on; it is not a timed strobe.
 ```mermaid
 flowchart TD
     Mic["INMP441 / mono I2S"] --> FFT["512-sample window and FFT"]
+    Mic --> VAD["Speech activity detector"]
     FFT --> Voice["Voice-band level and gate"]
+    VAD --> Voice
     FFT --> Bass["Bass background gate and confirmation"]
     Voice --> Curve["Fast envelope and green normalization"]
     Curve --> Green["Graduated green PWM"]
@@ -71,16 +83,21 @@ processing.
 removes the DC component, applies a Hann window to limit spectral leakage,
 and runs an in-place radix-2 Cooley–Tukey FFT — roughly 5k butterfly
 operations per frame, negligible for the C6. The bin width is 31.25 Hz, so
-the default bands map to FFT bins 1–8 (bass, 40–250 Hz) and 10–109 (voice,
-300–3400 Hz).
+the original band mapping is bins 1–8 (configured bass, 40–250 Hz) and
+10–109 (voice, 300–3400 Hz). The `c436c89` blue-only guard is retained:
+blue measures bins 2–8 because bin 1's center is below 40 Hz. The FFT is
+not a brick-wall filter; window leakage and reduced response near the
+lower band edge remain possible. Diagnostics report excluded and retained energy.
 
 **Levels and gating.** Signed PCM is divided by 8388608 before the FFT,
 giving samples in [-1, 1). One-sided band energy is converted to RMS power
 using `2 * energy / (FFT_size * sum(Hann_window_squared))`, then to dBFS.
 A full-scale sine is approximately -3.01 dBFS RMS. Green keeps its original
 -50 dBFS closing gate and -47 dBFS opening threshold. Blue's minimum gate
-is -40 dBFS, with 5 dB opening hysteresis and 64 ms of consecutive above-gate
-input before it activates. A closed gate immediately forces its PWM duty to
+is -40 dBFS, with 5 dB opening hysteresis and 32 ms of consecutive above-gate
+input before it activates. The previous 64 ms rule discarded hits confined
+to one block. Short acoustic disturbances can now also qualify; re-test
+quiet/no-bass negatives on the microphone. A closed gate immediately forces its PWM duty to
 zero, overriding any residual smoothed envelope.
 
 **Bass background rejection.** After the readiness animation, blue stays
@@ -90,11 +107,11 @@ active throughout. Blue then uses the higher of its minimum gate and the
 learned background plus 8 dB. The initial calibrated gate is now retained as
 a lower bound for the current calibration. Quiet gaps can lower the running
 noise estimate, but cannot lower this minimum gate and make blue more
-sensitive again. The estimate rises slowly only while the bass gate is
-closed and freezes during candidate or detected bass. A single 32 ms spike
-does not activate blue.
+sensitive again. The noise estimate updates only when the level is below
+the closing threshold. It freezes throughout the hysteresis gap, opening
+candidates and detected bass, so rejected soft music cannot ratchet it up.
 
-This rejects steady background and brief spikes; it cannot identify every
+This rejects background below the opening threshold; it cannot identify every
 noise source. Real disturbances that are stronger and longer than the
 threshold can still look like bass. If music was already playing during
 calibration, reboot with music off to obtain a new quiet calibration. The
@@ -118,7 +135,7 @@ on the next processed block, preserving clear gaps between words.
 `SONICSYNC_MAX_BRIGHTNESS` (4095 by default). When its gate is closed, duty
 is exactly zero. There is no intermediate brightness, envelope fade, gamma
 or volume normalization on blue. Background calibration, hysteresis and
-64 ms confirmation remain in place to limit unwanted flicker.
+32 ms confirmation remain. Existing amplitude gates are not lowered.
 
 **Green loud-music normalization.** The normal upper reference is -12 dBFS (base
 gate -50 plus span 38). Only active, noise-gated voice-band input can raise it,
@@ -220,7 +237,10 @@ under **SonicSync32 Configuration**. Defaults:
 | Green gate hysteresis         | 3 dB    | Green opening threshold is -47 dBFS |
 | Bass gate offset              | +10 dB  | Minimum blue closing gate is -40 dBFS |
 | Bass gate hysteresis          | 5 dB    | Quiet-baseline opening threshold is -35 dBFS |
-| Bass trigger confirmation     | 64 ms   | Reject isolated one-frame spikes |
+| Bass hit confirmation         | 32 ms   | New `BASS_HIT_CONFIRM_MS` key replaces the legacy 64 ms setting |
+| Green speech filter           | 1, mode 2 | Require speech activity plus the existing energy gate |
+| Green tone veto               | 95% | Maximum energy share in three adjacent voice bins; 100 disables it |
+| Per-frame detector trace      | 0 | Enable briefly for labelled microphone tests |
 | Bass startup calibration      | 1500 ms | Keep music off briefly after the animation |
 | Bass background margin        | 8 dB    | Minimum difference above learned background |
 | Blue output                   | 0 / configured cap | Binary, no brightness graduation |
@@ -317,7 +337,59 @@ pio device monitor -p COMx -b 115200
 
 ## Verification status
 
-### Blue-only gate fixes (on-board verified, 2026-11-09)
+### Current candidate: speech filter and soft-bass fix (on-board results, 2026-11-09)
+
+Host checks on this machine (Clang 22.1.8 on Windows, `-Werror`; UBSan
+omitted for its Windows runtime): the ordinary suite passes including the
+soft-bass noise-learning probe and the retained 31.25 Hz rumble fixture;
+`--voice-fixture` lights green on 106/169 speech blocks; `--filter-smoke`
+rejects steady 500/1000/1600/2400/3150 Hz tones with the real VAD and fails
+closed on invalid rate/mode.
+
+On-board session on the project ESP32-C6 (CH343, COM6). Firmware 225,360
+bytes, RAM 6.3 %, flash 21.4 %. Test configuration: speech filter enabled,
+tone veto 95 %, blue confirm 32 ms, `TRACE=1 FRAME_TRACE=1 FORCE_OFF=0`;
+boot log confirmed all compiled values and `blue lo bin 2`.
+
+| Test (labelled capture + physical LEDs) | Measured result |
+|-----------------------------------------|-----------------|
+| **Failing music passage** (user's actual passage, both VAD modes) | User: LEDs look right. Data: the passage's bass concentrates in bin 1 (excluded by the fan guard: `excluded` to -30.4 dB, `raw` to -25.4 dB) while the retained 62.5–250 Hz band sat at -35…-39 dB with one -27.1 dB peak; blue lit on that peak and stayed dark otherwise, green stayed quiet (24 speech frames). The bin-1 exclusion is a measured trade-off: it rejects the fans but also hides sub-47 Hz-only bass |
+| **Talking** | Green follows speech in both modes (mode 2: 428 speech frames, user confirmed; mode 3: 317 speech frames, green duties 1–1852). Blue also reacts to a deep voice: fundamentals at 85–180 Hz are inside the bass band (voice bass to -23.5 dB). With a -48 dB floor calibration this caused 115 blue rises; with a -39 dB floor calibration 6 rises. This overlap is acoustic, not new to this candidate, and is not separable without a voice veto that would also suppress vocal music |
+| **High-pitched instrumental** (user confirmed: no vocals) | Mode 2 (default): VAD falsely accepted 413 frames as speech, green lit 147/1875 frames (7.8 %); the tone veto cannot catch it (accepted frames had tone share 22–92 %). Mode 3 (aggressive): false speech dropped to 237 frames, green lit 37/1875 (2.0 %), while talking still responded. The committed default stays mode 2; this board is deployed with mode 3 |
+| **Quiet (music off)** | Fans/PC noise remain measurable. With the quietest calibration (floor -48, open -35) four 1–2-frame fan bursts (retained band ≤ -33.3 dB) opened blue under the new 32 ms confirm — 4 rises in 120 s, binary duties only. With a noisier calibration (floor -39, open -26) fans no longer breach, but soft music below -26 dB is then also missed. No ghost lighting: with `FORCE_OFF=1` blue stayed physically dark during loud bass, confirming the driver/wiring follows the commanded duty — an earlier "blue stayed ON" observation did not reproduce and matched only a single commanded frame |
+| **Bass acceptance (soft then strong)** | Playback peaked at -25.1 dB retained with the open -26 calibration — blue lit one frame; sensitivity in that session was calibration-limited (floor -39). Stronger hits at other times (previous sessions: -9 to -24 dB) open blue reliably; binary 0/4095 duties throughout |
+
+Unresolved and reported honestly: the VAD does not provide vocal separation
+(mode 3 reduces but does not eliminate false speech on the user's
+instrumental track), deep sub-47 Hz bass is traded away by the fan guard, and
+voice bass can light blue because it is physically in the bass band. If these
+classes must be separated, labelled raw 16 kHz INMP441 recordings are needed
+for training; the feature logs above are not a training set.
+
+For short labelled trials set `SONICSYNC_DETECTOR_FRAME_TRACE=1`,
+`SONICSYNC_BASS_DIAGNOSTIC_TRACE=1` and keep
+`SONICSYNC_BASS_DIAGNOSTIC_FORCE_OFF=0`. Every `AUDIO_FRAME` reports retained
+bass, opening level, floor/minimum, original/excluded bass energy, retained
+peak bin, voice classification, tone share and commanded PWM. `vf=1`
+confirms speech selection is enabled; `vg` gives its acceptance/rejection
+stage. `raw` and `excluded` are band-energy dBFS, not PCM recordings.
+All trace options and `FORCE_OFF` were restored to zero for the deployed
+build; `voice_filter_mode=3` is this board's sdkconfig choice.
+
+```bash
+python tests/run_host_tests.py
+python tests/run_host_tests.py --voice-fixture
+python tests/run_host_tests.py --filter-smoke
+python tools/capture_detector.py --port COM6 --seconds 120 --label quiet --expect-off
+python tools/capture_detector.py --port COM6 --seconds 20 --label failing_music
+```
+
+`python tests/run_host_tests.py --replay-wav recording.wav` accepts mono
+PCM16 at the configured rate. It prepends synthetic quiet for calibration;
+it does not reproduce the room calibration, and phone audio is not INMP441
+audio. No custom speech/bass model was trained.
+
+### Historical c436c89 blue-only gate tests (on-board session, 2026-11-09)
 
 The user reported false blue flicker on the deployed `4440c4c` firmware.
 Two blue-only defects were found and fixed:
@@ -335,7 +407,9 @@ blue stays off until it is rebooted in quiet).
 **2. Sub-band-edge rumble.** The acceptance quiet phase still showed four
 false blue ON transitions in ~160 s with music off, all with the same
 fingerprint: `BLUE_EDGE` levels of -22.1 to -25.3 dBFS, peak at 31.25 Hz
-(FFT bin 1) and 99.7–99.9% of the bass-band energy in that single bin. The
+(FFT bin 1) and 99.7–99.9% bass share. That field measures bass-band energy
+as a fraction of total analysed energy; it does not measure the fraction
+in one bin. The
 user confirmed fans/ventilation run next to the mic — fan blade-pass
 rumble sits at ~31 Hz. Bin 1's center lies below the configured 40 Hz low
 edge, yet the old bin mapping included it. Blue now skips the lowest band
@@ -406,7 +480,7 @@ rather than relying on an excluded generated sdkconfig.
 |--------------|-------------|
 | ESP32-C6 target build, Espressif32 7.0.1 / ESP-IDF 6.0.1 | PASS — firmware.bin 213,536 bytes; 16 MB flash setting retained |
 | Learned steady bass background | PASS — blue stays off, green still responds to voice |
-| Isolated 32 ms bass spikes | PASS — rejected; a 64 ms above-threshold hit responds |
+| Short-hit confirmation, historical 4440c4c | Old 64 ms rule rejected one-block hits; current candidate accepts 32 ms |
 | Startup calibration | PASS — blue off while learning; green active |
 | Sustained bass after a quiet calibration | PASS — remains detected, not learned away |
 | Green intermediate brightness | PASS — quieter/darker, monotonic graduation to full scale |
@@ -528,7 +602,7 @@ firmware; levels are the per-second console values in dBFS.
 
 ## Serial output on boot
 
-### Current firmware — sharp voice / binary bass (on-board capture, 2026-11-09)
+### Historical firmware 4440c4c (on-board capture, 2026-11-09)
 
 Captured on COM6 with the release build flashed from this checkout:
 

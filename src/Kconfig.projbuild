@@ -102,13 +102,24 @@ menu "SonicSync32 Configuration"
         default 5
 
     config SONICSYNC_BASS_CONFIRM_MS
-        int "Bass trigger confirmation time (ms)"
-        range 0 250
+        int
         default 64
         help
+            Legacy value retained for old configurations. Replaced by
+            SONICSYNC_BASS_HIT_CONFIRM_MS so saved 64 ms values do not
+            silently mask the short-hit correction.
+
+    config SONICSYNC_BASS_HIT_CONFIRM_MS
+        int "Bass hit confirmation time (ms)"
+        range 0 250
+        default 32
+        help
             Bass must stay above its opening threshold for this long.
-            Rejects isolated one-frame spikes; 64 ms is two blocks at
-            the default sample rate/FFT size. Quiet still forces OFF.
+            32 ms accepts one FFT block at 16 kHz/512 samples. The older
+            64 ms rule discarded hits confined to one block. This also
+            accepts short low-frequency disturbances above the gate:
+            verify quiet/no-bass negatives on the real microphone.
+            The amplitude gate is unchanged. Blue remains binary.
 
     config SONICSYNC_BASS_CALIBRATION_MS
         int "Bass background calibration after readiness (ms)"
@@ -128,6 +139,8 @@ menu "SonicSync32 Configuration"
             learned background+margin. The calibrated gate is retained
             as a lower bound so quiet gaps cannot increase sensitivity.
             Reboot in quiet to recalibrate after moving to another room.
+            Noise is updated only below the closing threshold; audio
+            in the hysteresis gap is not learned as background.
 
     config SONICSYNC_BASS_DIAGNOSTIC_TRACE
         int "Blue diagnostic transition logging (0=off, 1=on)"
@@ -137,6 +150,46 @@ menu "SonicSync32 Configuration"
             Log each detector transition with level, gate, calibrated
             minimum, nearest FFT peak-bin frequency and bass energy share.
             Green processing and all audio capture settings are unchanged.
+
+    config SONICSYNC_DETECTOR_FRAME_TRACE
+        int "Per-frame detector diagnostics (0=off, 1=on)"
+        range 0 1
+        default 0
+        help
+            Log every FFT decision including blue opening threshold,
+            bass share, peak frequency, voice/VAD and actual PWM duties.
+            Use for short labelled tests, then restore zero. A one-second
+            summary alone cannot verify a short bass hit.
+
+    config SONICSYNC_VOICE_FILTER_ENABLE
+        int "Speech detector before green brightness (0=bypass, 1=enable)"
+        range 0 1
+        default 1
+        help
+            Require WebRTC/libfvad speech activity as well as energy
+            in the configured voice band. Supports 8000, 16000, 32000
+            and 48000 Hz; unsupported rates fail initialization safely.
+            Reduces non-speech triggers but does not isolate vocals from
+            music or guarantee rejection of instruments and singing.
+            Keeps green brightness, normalization and envelope settings.
+
+    config SONICSYNC_VOICE_FILTER_MODE
+        int "Speech filter aggressiveness (0=least, 3=most)"
+        range 0 3
+        default 2
+        help
+            Start at 2. Higher values may reject quiet or distant speech.
+
+    config SONICSYNC_VOICE_TONE_SHARE_PERCENT
+        int "Green pure-tone veto: maximum energy in 3 voice FFT bins (%)"
+        range 50 100
+        default 95
+        help
+            When the speech filter is enabled, reject a voice-band frame
+            if three neighboring bins contain this much of its energy.
+            Rejects nearly pure tones that VAD can mistake for speech.
+            Does not reject all instruments or isolate vocals from songs.
+            Lower values can reject voiced vowels. 100 disables the veto.
 
     config SONICSYNC_BASS_DIAGNOSTIC_FORCE_OFF
         int "Blue diagnostic forced OFF (0=normal, 1=force off)"

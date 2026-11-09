@@ -5,8 +5,8 @@
  *
  * Reads music through an INMP441 I2S microphone (left channel) and drives
  * two external LED channels:
- *   - GREEN: brightness follows voice-range audio energy (300-3400 Hz)
- *   - BLUE : brightness follows bass energy (40-250 Hz)
+ *   - GREEN: speech activity plus voice-band energy (300-3400 Hz)
+ *   - BLUE : binary bass indicator (40-250 Hz)
  *
  * This is frequency-reactive lighting, not speech recognition.
  *
@@ -27,8 +27,10 @@
  *   4. Both LEDs OFF, audio capture active, waiting for music.
  *   Initialization failure: LEDs stay OFF, no ready indication, ever.
  *
- * Normal operation: silence keeps both LEDs OFF. Green follows speech-band
- * energy through a fast envelope and brightness curve. Blue is binary:
+ * Normal operation: silence keeps both LEDs OFF. Green requires speech
+ * activity then follows band energy through its existing envelope/curve.
+ * VAD does not separate vocals from music or guarantee speech exclusivity.
+ * Blue is binary:
  * confirmed bass -> configured maximum duty, closed gate -> zero.
  * Bands, detection and green response are configurable in Kconfig.
  */
@@ -44,6 +46,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/i2s_std.h"
+#include "voice_filter.h"
 
 static const char *TAG = "SonicSync32";
 
@@ -75,11 +78,15 @@ static const char *TAG = "SonicSync32";
 #define CFG_PWM_FREQ_HZ   CONFIG_SONICSYNC_LED_PWM_FREQ
 #define CFG_BASS_OFFSET  CONFIG_SONICSYNC_BASS_GATE_OFFSET_DB
 #define CFG_BASS_HYST    CONFIG_SONICSYNC_BASS_GATE_HYSTERESIS_DB
-#define CFG_BASS_CONFIRM CONFIG_SONICSYNC_BASS_CONFIRM_MS
+#define CFG_BASS_CONFIRM CONFIG_SONICSYNC_BASS_HIT_CONFIRM_MS
 #define CFG_BASS_CAL_MS  CONFIG_SONICSYNC_BASS_CALIBRATION_MS
 #define CFG_BASS_MARGIN  CONFIG_SONICSYNC_BASS_NOISE_MARGIN_DB
 #define CFG_BLUE_TRACE   CONFIG_SONICSYNC_BASS_DIAGNOSTIC_TRACE
 #define CFG_BLUE_FORCE_OFF CONFIG_SONICSYNC_BASS_DIAGNOSTIC_FORCE_OFF
+#define CFG_FRAME_TRACE CONFIG_SONICSYNC_DETECTOR_FRAME_TRACE
+#define CFG_VOICE_FILTER CONFIG_SONICSYNC_VOICE_FILTER_ENABLE
+#define CFG_VOICE_MODE CONFIG_SONICSYNC_VOICE_FILTER_MODE
+#define CFG_VOICE_TONE_MAX CONFIG_SONICSYNC_VOICE_TONE_SHARE_PERCENT
 #define CFG_VOICE_SENS   CONFIG_SONICSYNC_VOICE_SENSITIVITY
 #define CFG_NORM_HEADROOM CONFIG_SONICSYNC_NORMALIZE_HEADROOM_DB
 #define CFG_NORM_ATTACK CONFIG_SONICSYNC_NORMALIZE_ATTACK_MS
@@ -220,6 +227,9 @@ static float   s_window_power;
 static float s_env_voice_db = -120.0f; /* green brightness envelope (dB) */
 static bool  s_bass_on      = false;    /* noise gate states */
 static bool  s_voice_on     = false;
+static bool  s_voice_level_on = false;
+static bool  s_speech = false;
+static float s_voice_tone_share;
 static bool  s_music_on     = false;    /* music/silence state (logging) */
 
 static float s_attack_coef;             /* per-block smoothing coefficients */
@@ -485,6 +495,23 @@ static float energy_to_db(float energy)
     return 10.0f * log10f(norm);
 }
 
+/* A nearly pure tone is not sufficient evidence of speech, even if VAD
+ * accepts it. Measure the strongest three adjacent bins within the voice
+ * band. Three bins include the Hann main lobe of an off-bin sinusoid.
+ * This is a conservative veto, not a general music/voice separator.
+ */
+static float voice_tone_share(float energy)
+{
+    if (energy < 1e-12f) return 0.0f;
+    float peak = 0.0f;
+    for (int b = s_bin_voice_lo; b <= s_bin_voice_hi; b++) {
+        int end = b + 2 < s_bin_voice_hi ? b + 2 : s_bin_voice_hi;
+        float e = band_energy(b, end);
+        peak = fmaxf(peak, e);
+    }
+    return 100.0f * peak / energy;
+}
+
 /* Noise gate with hysteresis (per band, sticky state). */
 static bool gate_pass(float db, bool *state)
 {
@@ -553,10 +580,15 @@ static bool bass_gate_pass(float db)
         }
     } else {
         s_bass_confirm_count = 0;
-        float coef = db < s_bass_noise_db ? s_noise_down_coef : s_noise_up_coef;
-        s_bass_noise_db += coef * (db - s_bass_noise_db);
+        /* The hysteresis gap is uncertain audio, not established noise.
+         * Learning it as background ratchets the opening threshold upward
+         * during soft music and can block a later stronger bass hit. */
+        if (db < gate) {
+            float coef = db < s_bass_noise_db ? s_noise_down_coef : s_noise_up_coef;
+            s_bass_noise_db += coef * (db - s_bass_noise_db);
+        }
     }
-    /* Freeze the noise floor during detected bass and candidate beats. */
+    /* Freeze during bass, opening candidates AND the hysteresis gap. */
     s_bass_gate_db = gate;
     return s_bass_on;
 }
@@ -585,6 +617,45 @@ static void blue_trace(float db, uint32_t output)
              (double)s_bass_gate_db, (double)s_bass_gate_min_db,
              (double)s_bass_noise_db, (double)hz, (double)share,
              (unsigned long)s_blue_on_requests, CFG_BLUE_FORCE_OFF);
+}
+
+/* At 512/16 kHz this emits 31.25 records/s, not a lossy 1 Hz summary.
+ * Enable only while capturing a test. The fields explain every blue decision.
+ */
+static void detector_trace(float bass_db, float voice_db,
+                           uint32_t green, uint32_t blue)
+{
+    if (!CFG_FRAME_TRACE) return;
+    int peak_bin = s_bin_bass_lo_blue;
+    float peak = 0.0f;
+    for (int b = s_bin_bass_lo_blue; b <= s_bin_bass_hi; b++) {
+        float e = s_re[b] * s_re[b] + s_im[b] * s_im[b];
+        if (e > peak) { peak = e; peak_bin = b; }
+    }
+    float bass = band_energy(s_bin_bass_lo_blue, s_bin_bass_hi);
+    float excluded = s_bin_bass_lo_blue > s_bin_bass_lo ?
+        band_energy(s_bin_bass_lo, s_bin_bass_lo_blue - 1) : 0.0f;
+    float total = band_energy(1, CFG_FFT_N / 2 - 1);
+    float share = total > 1e-12f ? 100.0f * bass / total : 0.0f;
+    const char *reason = !s_bass_calibrated ? "calibrating" :
+        CFG_BLUE_FORCE_OFF ? "forced_off" : s_bass_on ? "on" :
+        s_bass_confirm_count ? "confirming" : "below_open";
+    const char *voice_reason = !s_voice_level_on ? "level" :
+        !s_speech ? "vad" : CFG_VOICE_FILTER && CFG_VOICE_TONE_MAX < 100 &&
+        s_voice_tone_share >= CFG_VOICE_TONE_MAX ? "tone" : "accepted";
+    ESP_LOGI(TAG, "AUDIO_FRAME n=%lu bass=%.1f gate=%.1f open=%.1f "
+             "floor=%.1f min=%.1f raw=%.1f excluded=%.1f lowbin=%d "
+             "share=%.1f peak=%.2f voice=%.1f "
+             "vf=%d speech=%d tone_share=%.1f vg=%s green=%lu blue=%lu reason=%s",
+             (unsigned long)s_block_count, (double)bass_db,
+             (double)s_bass_gate_db, (double)(s_bass_gate_db + CFG_BASS_HYST),
+             (double)s_bass_noise_db, (double)s_bass_gate_min_db,
+             (double)energy_to_db(bass + excluded),
+             (double)energy_to_db(excluded), s_bin_bass_lo_blue,
+             (double)share, (double)(peak_bin * (float)CFG_SAMPLE_RATE / CFG_FFT_N),
+             (double)voice_db, CFG_VOICE_FILTER, (int)s_speech,
+             (double)s_voice_tone_share, voice_reason, (unsigned long)green,
+             (unsigned long)blue, reason);
 }
 
 /* Green-only loud-music reference. Blue is a binary bass indicator. */
@@ -629,9 +700,13 @@ static void reset_audio_state(void)
 {
     s_bass_on = false;
     s_voice_on = false;
+    s_voice_level_on = false;
+    s_speech = false;
+    s_voice_tone_share = 0.0f;
     s_music_on = false;
     s_env_voice_db = -120.0f;
     bass_control_reset();
+    if (CFG_VOICE_FILTER) voice_filter_reset();
     led_set(LED_GREEN, 0);
     led_set(LED_BLUE, 0);
 }
@@ -644,6 +719,8 @@ static void process_audio_block(void)
         vTaskDelay(pdMS_TO_TICKS(50));
         return;
     }
+
+    s_speech = !CFG_VOICE_FILTER || voice_filter_process(s_raw, CFG_FFT_N);
 
     /*
      * Normalize signed PCM to [-1, 1) BEFORE measuring energy in dBFS.
@@ -670,7 +747,10 @@ static void process_audio_block(void)
 
     s_bass_on  = bass_gate_pass(db_bass);
     bool voice_was_on = s_voice_on;
-    s_voice_on = gate_pass(db_voice, &s_voice_on);
+    s_voice_tone_share = voice_tone_share(e_voice);
+    bool tone_ok = !CFG_VOICE_FILTER || CFG_VOICE_TONE_MAX == 100 ||
+                   s_voice_tone_share < CFG_VOICE_TONE_MAX;
+    s_voice_on = gate_pass(db_voice, &s_voice_level_on) && s_speech && tone_ok;
     if (s_voice_on && !voice_was_on) {
         /* A new syllable starts from the gate, not the silent -120 dB floor. */
         s_env_voice_db = CFG_GATE_DB;
@@ -698,6 +778,7 @@ static void process_audio_block(void)
     blue_trace(db_bass, blue);
 
     s_block_count++;
+    detector_trace(db_bass, db_voice, green, blue);
     if (s_block_count % (CFG_SAMPLE_RATE / CFG_FFT_N) == 0) {
         ESP_LOGI(TAG, "bass %.1f/%s floor %.1f gate %.1f | voice %.1f/%s | "
                  "ref %.1f dBFS | green %lu blue %lu | bass-cal %lu/%lu | "
@@ -724,6 +805,8 @@ static void log_config(void)
              (unsigned long)CFG_MAX_BRIGHT);
     ESP_LOGI(TAG, "FFT block %d samples, sample rate %d Hz",
              CFG_FFT_N, CFG_SAMPLE_RATE);
+    ESP_LOGI(TAG, "Green speech filter: enabled=%d mode=%d tone-veto=%d%% (not vocal separation)",
+             CFG_VOICE_FILTER, CFG_VOICE_MODE, CFG_VOICE_TONE_MAX);
     ESP_LOGI(TAG, "Blue BINARY 0/%lu; green response %d%%; bass offset %d dB, "
              "hysteresis %d dB, confirm %d ms, calibration %d ms",
              (unsigned long)CFG_MAX_BRIGHT, CFG_VOICE_SENS, CFG_BASS_OFFSET, CFG_BASS_HYST,
@@ -762,6 +845,11 @@ void app_main(void)
     esp_err_t err = led_init();
     if (err == ESP_OK) {
         err = i2s_mic_init();
+    }
+    if (err == ESP_OK && CFG_VOICE_FILTER &&
+        !voice_filter_init(CFG_SAMPLE_RATE, CFG_VOICE_MODE)) {
+        ESP_LOGE(TAG, "Voice filter allocation/configuration failed");
+        err = ESP_FAIL;
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Initialization FAILED: %s — readiness animation "
