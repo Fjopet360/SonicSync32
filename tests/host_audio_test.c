@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdarg.h>
 
 typedef int esp_err_t;
 typedef int ledc_channel_t;
@@ -32,10 +33,19 @@ typedef void *i2s_chan_handle_t;
 #define I2S_GPIO_UNUSED (-1)
 #define portMAX_DELAY UINT32_MAX
 #define pdMS_TO_TICKS(ms) (ms)
-#define ESP_LOGI(tag, fmt, ...) ((void)(tag))
-#define ESP_LOGD(tag, fmt, ...) ((void)(tag))
-#define ESP_LOGW(tag, fmt, ...) ((void)(tag))
-#define ESP_LOGE(tag, fmt, ...) ((void)(tag))
+static void host_log(const char *tag, const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    (void)tag;
+}
+#define ESP_LOGI(...) host_log(__VA_ARGS__)
+#define ESP_LOGD(...) host_log(__VA_ARGS__)
+#define ESP_LOGW(...) host_log(__VA_ARGS__)
+#define ESP_LOGE(...) host_log(__VA_ARGS__)
 
 typedef struct {
     int speed_mode, duty_resolution, timer_num, freq_hz, clk_cfg;
@@ -172,6 +182,17 @@ static void tones(float bass, float voice, float dc)
     }
 }
 
+/* Single-frequency fixture for band-edge checks. */
+static void tone_hz(float peak, float hz)
+{
+    for (int i = 0; i < CFG_FFT_N; i++) {
+        float t = (float)i / CFG_SAMPLE_RATE;
+        float sample = peak * sinf(2 * FFT_PI * hz * t);
+        int32_t pcm = (int32_t)lroundf(sample * 8388608.0f);
+        input_words[i] = pcm * 256;
+    }
+}
+
 static void frames(unsigned count)
 {
     while (count--) {
@@ -204,6 +225,30 @@ static void warm_up_quiet(void)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--green-trace")) {
+        reset_fixture();
+        const float bass_levels[] = {0, 0.003f, 0.03f, 0.1f, 0.4f};
+        const float voice_levels[] = {0, 0.004f, 0.01f, 0.1f, 0.3f};
+        for (int block = 0; block < 1200; block++) {
+            tones(bass_levels[(block / 17) % 5], voice_levels[(block / 7) % 5], 0);
+            read_error = block == 333 || block == 777;
+            frames(1);
+            printf("%u\n", duty[0]);
+        }
+        return 0;
+    }
+#ifdef CFG_BLUE_FORCE_OFF
+    if (argc > 1 && !strcmp(argv[1], "--blue-off-smoke")) {
+        reset_fixture();
+        warm_up_quiet();
+        tones(0.1f, 0.1f, 0);
+        frames(60);
+        assert(CFG_BLUE_FORCE_OFF && s_bass_on && !duty[1] && duty[0] > 0);
+        assert(s_blue_on_requests > 0);
+        puts("PASS: diagnostic forced OFF affects blue only, green remains active");
+        return 0;
+    }
+#endif
 #ifdef CFG_BASS_OFFSET
     if (argc > 1 && !strcmp(argv[1], "--speech-probe")) {
         reset_fixture();
@@ -383,6 +428,24 @@ int main(int argc, char **argv)
     assert(s_bass_on && duty[1] > 0);
     puts("PASS: isolated 32 ms spikes rejected; a 64 ms bass hit responds");
 
+    /* Blue-only low-edge guard: bin 1 (center 31.25 Hz) is skipped when its
+       center sits below the configured 40 Hz edge. A sub-band tone leaks
+       -6 dB into bin 2 through the Hann kernel, so choose a level whose
+       bin-2 leakage stays below the -35 dBFS opening threshold while the
+       same level at 125 Hz (in-band) must still open blue. */
+    reset_fixture();
+    warm_up_quiet();
+    tone_hz(0.0355f, 31.25f); /* bin 1 at -32 dB; bin 2 leakage -38 dB */
+    frames(8);
+    assert(!s_bass_on && !duty[1] && s_blue_on_requests == 0);
+    tone_hz(0.0355f, 125.0f); /* same level in-band opens blue */
+    frames(4);
+    assert(s_bass_on && duty[1] == CFG_MAX_BRIGHT && s_blue_on_requests == 1);
+    quiet_noise();
+    frames(1);
+    assert(!s_bass_on && !duty[1]);
+    puts("PASS: sub-band 31.25 Hz bin cannot gate blue; equal-level 125 Hz bass opens it");
+
     reset_fixture();
     warm_up_quiet();
     tones(rms_to_peak * powf(10, -38.0f / 20), 0, 0);
@@ -469,8 +532,19 @@ int main(int argc, char **argv)
     frames(150);
     tones(0.1f, 0, 0);
     frames(60);
+    /* With a locked minimum, recalibrate in quiet instead of self-weakening. */
+#ifdef CFG_BLUE_FORCE_OFF
+    assert(!duty[1]);
+    reset_fixture();
+    warm_up_quiet();
+    tones(0.1f, 0, 0);
+    frames(60);
+    assert(duty[1] > 0);
+    puts("PASS: startup threshold stays locked; a quiet reboot recalibrates blue");
+#else
     assert(duty[1] > 0);
     puts("PASS: calibration during music recovers after a quiet interval");
+#endif
 
 #ifdef CFG_VOICE_ATTACK_MS
     reset_fixture();
@@ -528,6 +602,32 @@ int main(int argc, char **argv)
     assert(duty[1] == CFG_MAX_BRIGHT && s_reference_db == BASE_REFERENCE_DB);
     assert(duty[0] >= voice_without_bass - 2 && duty[0] <= voice_without_bass + 2);
     puts("PASS: loud bass cannot dim green through its voice-only normalizer");
+#ifdef CFG_BLUE_FORCE_OFF
+    reset_fixture();
+    tones(rms_to_peak * powf(10, -44.2f / 20), 0, 0);
+    frames(BASS_CAL_FRAMES);
+    float calibrated_gate = s_bass_gate_db;
+    assert(fabsf(calibrated_gate - (-36.0f)) < 0.1f);
+    tones(rms_to_peak * powf(10, -33.0f / 20), 0, 0);
+    frames(2);
+    assert(!duty[1]);
+    tones(rms_to_peak * powf(10, -70.0f / 20), 0, 0);
+    frames(8);
+    tones(rms_to_peak * powf(10, -33.0f / 20), 0, 0);
+    frames(2);
+    assert(s_bass_gate_db >= calibrated_gate && !duty[1]);
+    tones(0.1f, 0, 0);
+    frames(2);
+    assert(duty[1] == CFG_MAX_BRIGHT && s_blue_on_requests == 1);
+    frames(60);
+    assert(s_blue_on_requests == 1);
+    quiet_noise();
+    frames(1);
+    assert(!duty[1]);
+    printf("PASS: 256 ms quiet gap cannot lower calibrated gate %.1f; "
+           "rejected background stays OFF, stronger bass ON\n", calibrated_gate);
+    puts("PASS: rising-edge counter counts transitions, not status lines");
+#endif
 #endif
 #endif
 

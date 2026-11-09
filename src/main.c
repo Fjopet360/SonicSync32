@@ -78,6 +78,8 @@ static const char *TAG = "SonicSync32";
 #define CFG_BASS_CONFIRM CONFIG_SONICSYNC_BASS_CONFIRM_MS
 #define CFG_BASS_CAL_MS  CONFIG_SONICSYNC_BASS_CALIBRATION_MS
 #define CFG_BASS_MARGIN  CONFIG_SONICSYNC_BASS_NOISE_MARGIN_DB
+#define CFG_BLUE_TRACE   CONFIG_SONICSYNC_BASS_DIAGNOSTIC_TRACE
+#define CFG_BLUE_FORCE_OFF CONFIG_SONICSYNC_BASS_DIAGNOSTIC_FORCE_OFF
 #define CFG_VOICE_SENS   CONFIG_SONICSYNC_VOICE_SENSITIVITY
 #define CFG_NORM_HEADROOM CONFIG_SONICSYNC_NORMALIZE_HEADROOM_DB
 #define CFG_NORM_ATTACK CONFIG_SONICSYNC_NORMALIZE_ATTACK_MS
@@ -229,13 +231,17 @@ static uint32_t s_bass_cal_count;
 static bool s_bass_calibrated;
 static float s_bass_noise_db;
 static float s_bass_gate_db;
+static float s_bass_gate_min_db; /* calibrated lower bound, not a quiet-gap EMA */
 static unsigned s_bass_confirm_count;
+static bool s_blue_last_request;
+static uint32_t s_blue_on_requests;
 static float s_reference_db;
 static float s_norm_attack_coef, s_norm_release_coef;
 static float s_noise_up_coef, s_noise_down_coef;
 
 static int s_bin_bass_lo, s_bin_bass_hi;    /* FFT bins per band */
 static int s_bin_voice_lo, s_bin_voice_hi;
+static int s_bin_bass_lo_blue; /* blue-only low bin (sub-band-edge rumble guard) */
 
 static uint32_t s_block_count;          /* for periodic debug logging */
 
@@ -425,9 +431,24 @@ static void band_bins_init(void)
         s_bin_voice_hi = s_bin_voice_lo;
     }
 
-    ESP_LOGI(TAG, "Bands: bass %d-%d Hz (bins %d-%d), voice %d-%d Hz "
+    /*
+     * Blue-only low-edge fidelity. FFT bin centers sit on a Fs/N grid, so
+     * the lowest band bin can have its CENTER below the configured bass low
+     * Hz (40 Hz maps to bin 1 whose center is 31.25 Hz and whose span is
+     * ~15.6-46.9 Hz). Sub-band rumble (fan blade-pass, ventilation) shows up
+     * exactly there. Blue skips that bin whenever its center falls below the
+     * configured edge; green and the shared capture/FFT are unchanged.
+     */
+    s_bin_bass_lo_blue = s_bin_bass_lo;
+    if ((float)s_bin_bass_lo_blue * CFG_SAMPLE_RATE / CFG_FFT_N <
+        (float)CFG_BASS_LO_HZ && s_bin_bass_lo_blue < s_bin_bass_hi) {
+        s_bin_bass_lo_blue++;
+    }
+
+    ESP_LOGI(TAG, "Bands: bass %d-%d Hz (bins %d-%d, blue lo bin %d), voice %d-%d Hz "
              "(bins %d-%d)",
              CFG_BASS_LO_HZ, CFG_BASS_HI_HZ, s_bin_bass_lo, s_bin_bass_hi,
+             s_bin_bass_lo_blue,
              CFG_VOICE_LO_HZ, CFG_VOICE_HI_HZ, s_bin_voice_lo, s_bin_voice_hi);
 }
 
@@ -486,6 +507,9 @@ static void bass_control_reset(void)
     s_bass_calibrated = (BASS_CAL_FRAMES == 0);
     s_bass_noise_db = -120.0f;
     s_bass_gate_db = (float)CFG_GATE_DB + CFG_BASS_OFFSET;
+    s_bass_gate_min_db = s_bass_gate_db;
+    s_blue_last_request = false;
+    s_blue_on_requests = 0;
     s_reference_db = BASE_REFERENCE_DB;
 }
 
@@ -509,13 +533,14 @@ static bool bass_gate_pass(float db)
             s_bass_calibrated = true;
             s_bass_gate_db = fmaxf((float)CFG_GATE_DB + CFG_BASS_OFFSET,
                                   s_bass_noise_db + CFG_BASS_MARGIN);
+            s_bass_gate_min_db = s_bass_gate_db;
             ESP_LOGI(TAG, "Bass background calibrated: floor %.1f, gate %.1f dBFS",
                      (double)s_bass_noise_db, (double)s_bass_gate_db);
         }
         return false;
     }
 
-    float gate = fmaxf((float)CFG_GATE_DB + CFG_BASS_OFFSET,
+    float gate = fmaxf(s_bass_gate_min_db,
                       s_bass_noise_db + CFG_BASS_MARGIN);
     bool was_on = s_bass_on;
     if (was_on) {
@@ -534,6 +559,32 @@ static bool bass_gate_pass(float db)
     /* Freeze the noise floor during detected bass and candidate beats. */
     s_bass_gate_db = gate;
     return s_bass_on;
+}
+
+/* Blue-only instrumentation. Reads the existing spectrum; never changes it. */
+static void blue_trace(float db, uint32_t output)
+{
+    bool changed = s_bass_on != s_blue_last_request;
+    if (s_bass_on && changed) s_blue_on_requests++;
+    s_blue_last_request = s_bass_on;
+    if (!CFG_BLUE_TRACE || !changed) return;
+
+    int peak_bin = s_bin_bass_lo_blue;
+    float peak = 0.0f;
+    for (int b = s_bin_bass_lo_blue; b <= s_bin_bass_hi; b++) {
+        float e = s_re[b] * s_re[b] + s_im[b] * s_im[b];
+        if (e > peak) { peak = e; peak_bin = b; }
+    }
+    float bass = band_energy(s_bin_bass_lo_blue, s_bin_bass_hi);
+    float total = band_energy(1, CFG_FFT_N / 2 - 1);
+    float share = total > 1e-12f ? 100.0f * bass / total : 0.0f;
+    float hz = peak > 0.0f ? (float)peak_bin * CFG_SAMPLE_RATE / CFG_FFT_N : 0.0f;
+    ESP_LOGI(TAG, "BLUE_EDGE req=%d duty=%lu db=%.1f gate=%.1f min=%.1f "
+             "floor=%.1f peak_bin_hz=%.2f bass_share=%.1f%% rises=%lu FORCE_OFF=%d",
+             (int)s_bass_on, (unsigned long)output, (double)db,
+             (double)s_bass_gate_db, (double)s_bass_gate_min_db,
+             (double)s_bass_noise_db, (double)hz, (double)share,
+             (unsigned long)s_blue_on_requests, CFG_BLUE_FORCE_OFF);
 }
 
 /* Green-only loud-music reference. Blue is a binary bass indicator. */
@@ -611,7 +662,7 @@ static void process_audio_block(void)
     }
     fft_c(s_re, s_im, CFG_FFT_N);
 
-    float e_bass  = band_energy(s_bin_bass_lo, s_bin_bass_hi);
+    float e_bass  = band_energy(s_bin_bass_lo_blue, s_bin_bass_hi);
     float e_voice = band_energy(s_bin_voice_lo, s_bin_voice_hi);
 
     float db_bass  = energy_to_db(e_bass);
@@ -641,18 +692,23 @@ static void process_audio_block(void)
                                                 CFG_VOICE_SENS) : 0;
     /* Bass is explicitly 0/1: no envelope, gamma or volume normalization. */
     uint32_t blue = s_bass_on ? CFG_MAX_BRIGHT : 0;
+    if (CFG_BLUE_FORCE_OFF) blue = 0; /* diagnostic override for blue only */
     led_set(LED_GREEN, green);
     led_set(LED_BLUE, blue);
+    blue_trace(db_bass, blue);
 
     s_block_count++;
     if (s_block_count % (CFG_SAMPLE_RATE / CFG_FFT_N) == 0) {
         ESP_LOGI(TAG, "bass %.1f/%s floor %.1f gate %.1f | voice %.1f/%s | "
-                 "ref %.1f dBFS | green %lu blue %lu | bass-cal %lu/%lu",
+                 "ref %.1f dBFS | green %lu blue %lu | bass-cal %lu/%lu | "
+                 "blue-min %.1f rises %lu FORCE_OFF=%d",
                  (double)db_bass, s_bass_on ? "on" : "off",
                  (double)s_bass_noise_db, (double)s_bass_gate_db,
                  (double)db_voice, s_voice_on ? "on" : "off",
                  (double)s_reference_db, (unsigned long)green, (unsigned long)blue,
-                 (unsigned long)s_bass_cal_count, (unsigned long)BASS_CAL_FRAMES);
+                 (unsigned long)s_bass_cal_count, (unsigned long)BASS_CAL_FRAMES,
+                 (double)s_bass_gate_min_db, (unsigned long)s_blue_on_requests,
+                 CFG_BLUE_FORCE_OFF);
     }
 }
 
@@ -674,6 +730,8 @@ static void log_config(void)
              CFG_BASS_CONFIRM, CFG_BASS_CAL_MS);
     ESP_LOGI(TAG, "Green loud-music reference: headroom %d dB, attack %d / release %d ms",
              CFG_NORM_HEADROOM, CFG_NORM_ATTACK, CFG_NORM_RELEASE);
+    ESP_LOGI(TAG, "Blue diagnostics: TRACE=%d FORCE_OFF=%d (normal operation requires FORCE_OFF=0)",
+             CFG_BLUE_TRACE, CFG_BLUE_FORCE_OFF);
 }
 
 static void idle_forever(void)

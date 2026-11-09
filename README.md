@@ -87,15 +87,18 @@ zero, overriding any residual smoothed envelope.
 off for 1.5 seconds while a bounded histogram measures the 80th percentile
 of the room's bass level. Keep music off for this short interval. Green is
 active throughout. Blue then uses the higher of its minimum gate and the
-learned background plus 8 dB. The background follows downward over quiet
-periods, rises slowly only while the bass gate is closed, and freezes during
-candidate or detected bass. Sustained music is therefore not continuously
-learned away as noise. A single 32 ms spike does not activate blue.
+learned background plus 8 dB. The initial calibrated gate is now retained as
+a lower bound for the current calibration. Quiet gaps can lower the running
+noise estimate, but cannot lower this minimum gate and make blue more
+sensitive again. The estimate rises slowly only while the bass gate is
+closed and freezes during candidate or detected bass. A single 32 ms spike
+does not activate blue.
 
 This rejects steady background and brief spikes; it cannot identify every
 noise source. Real disturbances that are stronger and longer than the
 threshold can still look like bass. If music was already playing during
-calibration, pause it for a few seconds so the background estimate recovers.
+calibration, reboot with music off to obtain a new quiet calibration. The
+stable minimum deliberately replaces automatic downward gate drift.
 
 **Green speech response and mapping.** The gated voice level feeds a 15 ms
 attack / 90 ms release exponential envelope. A newly opened voice gate seeds
@@ -314,6 +317,78 @@ pio device monitor -p COMx -b 115200
 
 ## Verification status
 
+### Blue-only gate fixes (on-board verified, 2026-11-09)
+
+The user reported false blue flicker on the deployed `4440c4c` firmware.
+Two blue-only defects were found and fixed:
+
+**1. Calibrated gate drift.** A host replay reproduced a code defect:
+calibration at -44 dBFS sets a -36 dBFS gate and rejects a -33 dBFS
+background fixture. After only 256 ms of quieter input, the running noise
+estimate pulled the gate down to -40 dBFS and the same background switched
+blue to 4095. The correction retains the calibrated gate as a minimum; the
+replay now keeps the background OFF and accepts stronger bass. A quiet
+reboot recalibrates the held minimum after changing rooms (or accidentally
+calibrating during music — the board locks a high gate in that case and
+blue stays off until it is rebooted in quiet).
+
+**2. Sub-band-edge rumble.** The acceptance quiet phase still showed four
+false blue ON transitions in ~160 s with music off, all with the same
+fingerprint: `BLUE_EDGE` levels of -22.1 to -25.3 dBFS, peak at 31.25 Hz
+(FFT bin 1) and 99.7–99.9% of the bass-band energy in that single bin. The
+user confirmed fans/ventilation run next to the mic — fan blade-pass
+rumble sits at ~31 Hz. Bin 1's center lies below the configured 40 Hz low
+edge, yet the old bin mapping included it. Blue now skips the lowest band
+bin whenever its center falls below the configured low edge (default:
+blue lo bin becomes 2, i.e. 62.5 Hz). Green's gate, envelope,
+normalization, brightness curve, settings and all shared capture/FFT
+functions are unchanged — a 1,200-block deterministic replay produced
+byte-identical green duties before and after both fixes. Blue is not
+disabled: the on-board bass check below opened it on real music bass with
+peaks at 62–218 Hz.
+
+Both host suites pass with `-Werror` (Clang 22.1.8 on Windows; UBSan
+omitted for its Windows runtime), including a new regression: a sub-band
+31.25 Hz tone at a level whose bin-2 Hann leakage stays below the gate
+cannot open blue, while the same level at 125 Hz still does.
+
+### Blue diagnostics and on-board acceptance results
+
+- `BASS_DIAGNOSTIC_TRACE=1` logs each `BLUE_EDGE` with requested state,
+  actual commanded duty, raw band level, gate/minimum/floor, nearest bass
+  FFT peak-bin frequency and bass energy share. `rises` counts actual
+  detector OFF-to-ON transitions; per-second ON samples are not event counts.
+- Normal operation requires `BASS_DIAGNOSTIC_FORCE_OFF=0` (the default).
+  A temporary value of 1 forces only blue's normal-operation duty to zero;
+  green remains active. If blue physically flickers while duty is forced to
+  zero, investigate its driver/wiring. A forced-off test cannot pass normal
+  bass acceptance, and must not be published as the fix. `FORCE_OFF` was
+  never raised during these tests; blue physical flicker with a zero
+  commanded duty was not observed, so the driver-isolation diagnostic was
+  not needed.
+- Acceptance run on the project board (CH343, COM6) with
+  `TRACE=1 FORCE_OFF=0` compiled in (test-only sdkconfig; the Kconfig
+  defaults stay zero):
+  - **Quiet calibration with music off** through the unchanged startup
+    animation: `floor -38.0, gate -30.0 dBFS`.
+  - **184-second labelled quiet phase** (requirement: 120 s): zero
+    `BLUE_EDGE` transitions, `rises` stayed 0 across 186 per-second status
+    lines, valid capture throughout.
+  - **Intentional bass**: the user played bass hits for ~38 s; blue opened
+    on the music (levels -9.2 to -23.6 dBFS, peak bins 62.5–218.75 Hz,
+    duty only 0 or 4095) and followed the hits — 103 rising edges. When
+    the bass stopped, blue returned to and stayed at 0.
+  - **One 30 ms burst** at 62.5 Hz about 25 s after the bass stopped was
+    confirmed by the user as a knock on the desk/mic while answering —
+    a genuine acoustic event, not a false trigger.
+- If background still triggers blue, use its edge data to identify the
+  remaining cause. Do not report completion based only on binary output or
+  silence obtained by disabling blue/setting an unreachable threshold.
+
+Both diagnostic options default to zero in Kconfig. Reboot in quiet to
+recalibrate the held minimum after changing rooms or accidentally
+calibrating during music.
+
 ### Sharp speech and binary bass response (new)
 
 The new software checks compile the real firmware with simulated I2S/LEDC
@@ -344,7 +419,7 @@ rather than relying on an excluded generated sdkconfig.
 | Normalization recovery | PASS — slow recovery, no quiet boost, immediate gated silence-to-OFF |
 | Loud rejected bass background | PASS — cannot dim green via normalization |
 | Loud detected bass | PASS — also cannot dim green via its voice-only normalizer |
-| Music accidentally playing during calibration | PASS — recovers after a quiet interval |
+| Music accidentally playing during calibration | With the blue-only correction, reboot in quiet to recalibrate; the gate no longer weakens automatically |
 | Calibration/confirmation configured to zero | PASS — optional bypass works |
 | Readiness animation / C6 RX / failure-to-OFF | PASS — preserved by regression tests |
 
@@ -367,7 +442,7 @@ Build, flash and a full audio test session on the project's ESP32-C6
 | Quiet 1.5 s after the startup blinks | **PASS** — music kept off during the unchanged 18-flash animation and calibration; log: `Bass background calibrated: floor -44.0, gate -36.0 dBFS` |
 | Talking → green responds | **PASS** — graduated duties track voice level: voice -29.6 dBFS → green 1047, -33.4 → 673, -37.6 → 469, -48.3 → 117, -49.0 → 67; blue stayed 0 |
 | Bass hits → blue responds | **PASS** — bass -23.5 dBFS → blue 4095 (green 0); gate close → 0. Blue duty was exactly 0 or 4095 in all 238 captured per-second status lines, never intermediate |
-| Sustained bass | **PASS** — blue held 4095 while bass stayed above its background-aware gate (54 blue-on events in the session) |
+| Sustained bass | Blue held 4095 while above its gate (54 ON status samples; the earlier firmware did not count rising-edge events) |
 | Mixed/loud music | **PASS** — simultaneous bass -32.0 dBFS and voice -33.0 dBFS → green 1579 + blue 4095; voice-dominant loud passage (voice -24.9 dBFS, bass below gate) → green 2164 (session max), blue 0 |
 | Silence → outputs off | **PASS** — both duties 0 whenever both bands fell below their gates; `Silence -> LEDs off` transitions logged throughout |
 | Physical session | Audio provided by the user: talking, bass hits, sustained bass, loud mixed music, then silence, with the board live on COM6 |

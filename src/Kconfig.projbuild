@@ -41,6 +41,11 @@ menu "SonicSync32 Configuration"
         int "Bass band low edge (Hz)"
         range 1 20000
         default 40
+        help
+            Blue skips the lowest selected FFT bin when its center falls
+            below this edge, so sub-band rumble (fan blade-pass at ~31 Hz
+            with a 40 Hz edge on the 16 kHz / 512-sample grid) cannot gate
+            blue. Green and the capture/FFT settings are unchanged.
 
     config SONICSYNC_BASS_HIGH_HZ
         int "Bass band high edge (Hz)"
@@ -120,8 +125,29 @@ menu "SonicSync32 Configuration"
         default 8
         help
             The effective bass gate is the higher of base+offset and
-            learned background+margin. Background follows downward in
-            quiet periods and rises slowly only while the gate is closed.
+            learned background+margin. The calibrated gate is retained
+            as a lower bound so quiet gaps cannot increase sensitivity.
+            Reboot in quiet to recalibrate after moving to another room.
+
+    config SONICSYNC_BASS_DIAGNOSTIC_TRACE
+        int "Blue diagnostic transition logging (0=off, 1=on)"
+        range 0 1
+        default 0
+        help
+            Log each detector transition with level, gate, calibrated
+            minimum, nearest FFT peak-bin frequency and bass energy share.
+            Green processing and all audio capture settings are unchanged.
+
+    config SONICSYNC_BASS_DIAGNOSTIC_FORCE_OFF
+        int "Blue diagnostic forced OFF (0=normal, 1=force off)"
+        range 0 1
+        default 0
+        help
+            Temporarily force only blue's normal-operation PWM to zero.
+            Green stays operational. If blue physically flickers while
+            its commanded output is zero, investigate the driver/wiring.
+            Set this back to zero before acceptance testing or publishing
+            a production configuration. Forced-off is not a bass fix.
 
     config SONICSYNC_BASS_SENSITIVITY
         int

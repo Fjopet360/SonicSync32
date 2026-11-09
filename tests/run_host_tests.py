@@ -24,6 +24,8 @@ def main():
                         help="override a Kconfig default for a configuration check")
     parser.add_argument("--config-smoke", action="store_true", help="run a short configuration check")
     parser.add_argument("--speech-probe", action="store_true", help="print speech-envelope timing response")
+    parser.add_argument("--green-trace", action="store_true", help="emit deterministic green-duty trace")
+    parser.add_argument("--blue-off-smoke", action="store_true", help="check blue-only diagnostic override")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     compiler = shlex.split(os.environ["CC"]) if "CC" in os.environ else [
@@ -59,7 +61,8 @@ def main():
                        f"-I{temp}"] + sanitizers + defines +
                        [str(root / "tests/host_audio_test.c"), "-lm", "-o", str(binary)],
                        check=True)
-        mode = (["--speech-probe"] if args.speech_probe else ["--config-smoke"] if args.config_smoke else ["--reproduce"] if args.reproduce else
+        mode = (["--green-trace"] if args.green_trace else ["--blue-off-smoke"] if args.blue_off_smoke else
+                ["--speech-probe"] if args.speech_probe else ["--config-smoke"] if args.config_smoke else ["--reproduce"] if args.reproduce else
                 ["--reproduce-ambient"] if args.reproduce_ambient else [])
         subprocess.run([str(binary)] + mode, check=True)
 
