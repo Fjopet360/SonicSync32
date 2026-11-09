@@ -83,23 +83,104 @@ menu "SonicSync32 Configuration"
             Level must exceed gate+hysteresis to turn on, and drop
             below gate to turn off. Prevents flicker.
 
+    config SONICSYNC_BASS_GATE_OFFSET_DB
+        int "Bass gate offset above the base gate (dB)"
+        range 0 40
+        default 10
+        help
+            Blue uses a higher gate than green. At the default base
+            gate of -50 dBFS, an offset of 10 gives -40 dBFS minimum.
+
+    config SONICSYNC_BASS_GATE_HYSTERESIS_DB
+        int "Bass gate hysteresis (dB)"
+        range 0 20
+        default 5
+
+    config SONICSYNC_BASS_CONFIRM_MS
+        int "Bass trigger confirmation time (ms)"
+        range 0 250
+        default 64
+        help
+            Bass must stay above its opening threshold for this long.
+            Rejects isolated one-frame spikes; 64 ms is two blocks at
+            the default sample rate/FFT size. Quiet still forces OFF.
+
+    config SONICSYNC_BASS_CALIBRATION_MS
+        int "Bass background calibration after readiness (ms)"
+        range 0 5000
+        default 1500
+        help
+            Keep music off briefly after the readiness animation.
+            Blue stays OFF while measuring the background bass level.
+            Green remains responsive. Zero disables startup calibration.
+
+    config SONICSYNC_BASS_NOISE_MARGIN_DB
+        int "Bass gate margin above learned background (dB)"
+        range 0 30
+        default 8
+        help
+            The effective bass gate is the higher of base+offset and
+            learned background+margin. Background follows downward in
+            quiet periods and rises slowly only while the gate is closed.
+
+    config SONICSYNC_BASS_SENSITIVITY
+        int
+        default 60
+        help
+            Legacy saved setting accepted for configuration compatibility.
+            Blue now switches between OFF and maximum configured brightness.
+
+    config SONICSYNC_VOICE_SENSITIVITY
+        int "Green brightness response (percent)"
+        range 10 200
+        default 85
+        help
+            A modest reduction from 100; voice detection is unchanged.
+            Lower values darken intermediate levels, retaining the
+            configured full-brightness endpoint.
+
+    config SONICSYNC_NORMALIZE_HEADROOM_DB
+        int "Green loud-music normalization headroom (dB)"
+        range 0 12
+        default 3
+        help
+            Lift green's full-brightness reference above loud voice-band
+            input so sustained party music does not pin green at maximum.
+            Never raises sensitivity for quiet audio or background noise.
+            Blue bypasses brightness normalization and stays binary.
+
+    config SONICSYNC_NORMALIZE_ATTACK_MS
+        int "Green loud-music normalization attack (ms)"
+        range 10 2000
+        default 150
+
+    config SONICSYNC_NORMALIZE_RELEASE_MS
+        int "Green loud-music normalization release (ms)"
+        range 250 20000
+        default 4000
+        help
+            Slow recovery of the brightness reference after loud music
+            avoids rapid gain pumping. Does not delay silence-to-OFF.
+
     config SONICSYNC_FULL_SCALE_DB
-        int "Level span from gate to full brightness (dB)"
+        int "Green base span from gate to full brightness (dB)"
         range 1 120
         default 38
         help
-            A channel reaches maximum brightness when its level is
-            gate + span dB. Lower values make the LEDs more lively.
+            The base full-brightness reference is base gate + span dB.
+            Loud-music normalization can raise this reference, without
+            changing either channel's detection threshold.
 
     config SONICSYNC_SENSITIVITY
-        int "Sensitivity (percent)"
+        int "Green master brightness sensitivity (percent)"
         range 10 500
         default 100
         help
-            Multiplier applied to the brightness mapping. 100 = 1x.
+            Multiplier applied to green's brightness mapping. 100 = 1x.
+            Blue bypasses this control and uses the configured maximum.
 
     config SONICSYNC_GAMMA
-        int "Brightness gamma (percent, 100 = linear)"
+        int "Green brightness gamma (percent, 100 = linear)"
         range 10 400
         default 180
         help
@@ -107,18 +188,34 @@ menu "SonicSync32 Configuration"
             <100 increases it. 100 gives a linear mapping.
 
     config SONICSYNC_ATTACK_MS
-        int "Envelope attack time (ms)"
-        range 1 1000
+        int
         default 60
         help
-            Rise smoothing when audio gets louder.
+            Legacy saved setting accepted for configuration compatibility.
+            Use the independent green speech-envelope setting below.
 
     config SONICSYNC_RELEASE_MS
-        int "Envelope release time (ms)"
-        range 1 2000
+        int
         default 300
         help
-            Fall smoothing when audio gets quieter.
+            Legacy saved setting accepted for configuration compatibility.
+
+    config SONICSYNC_VOICE_ATTACK_MS
+        int "Green speech-envelope attack (ms)"
+        range 1 1000
+        default 15
+        help
+            Faster rise for speech syllables. New setting so an existing
+            sdkconfig's old 60 ms attack does not override this default.
+            The output update interval is still one FFT block (32 ms).
+
+    config SONICSYNC_VOICE_RELEASE_MS
+        int "Green speech-envelope release (ms)"
+        range 1 2000
+        default 90
+        help
+            Shorter decay follows articulation instead of hanging between
+            phrases. A closed voice gate still forces immediate OFF.
 
     config SONICSYNC_MAX_BRIGHTNESS
         int "Maximum LED brightness (0-4095)"

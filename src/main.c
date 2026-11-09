@@ -27,10 +27,10 @@
  *   4. Both LEDs OFF, audio capture active, waiting for music.
  *   Initialization failure: LEDs stay OFF, no ready indication, ever.
  *
- * Normal operation: silence keeps both LEDs OFF; music drives the LEDs
- * through band energy -> noise gate -> attack/release smoothing ->
- * gamma brightness mapping. All bands, sensitivity, smoothing and
- * brightness limits are configurable (see src/Kconfig.projbuild).
+ * Normal operation: silence keeps both LEDs OFF. Green follows speech-band
+ * energy through a fast envelope and brightness curve. Blue is binary:
+ * confirmed bass -> configured maximum duty, closed gate -> zero.
+ * Bands, detection and green response are configurable in Kconfig.
  */
 
 #include <stdio.h>
@@ -68,11 +68,26 @@ static const char *TAG = "SonicSync32";
 #define CFG_SPAN_DB       CONFIG_SONICSYNC_FULL_SCALE_DB
 #define CFG_SENSITIVITY   CONFIG_SONICSYNC_SENSITIVITY
 #define CFG_GAMMA         CONFIG_SONICSYNC_GAMMA
-#define CFG_ATTACK_MS     CONFIG_SONICSYNC_ATTACK_MS
-#define CFG_RELEASE_MS    CONFIG_SONICSYNC_RELEASE_MS
+#define CFG_VOICE_ATTACK_MS CONFIG_SONICSYNC_VOICE_ATTACK_MS
+#define CFG_VOICE_RELEASE_MS CONFIG_SONICSYNC_VOICE_RELEASE_MS
 #define CFG_MAX_BRIGHT    CONFIG_SONICSYNC_MAX_BRIGHTNESS
 #define CFG_ANIM_BRIGHT   CONFIG_SONICSYNC_ANIM_BRIGHTNESS
 #define CFG_PWM_FREQ_HZ   CONFIG_SONICSYNC_LED_PWM_FREQ
+#define CFG_BASS_OFFSET  CONFIG_SONICSYNC_BASS_GATE_OFFSET_DB
+#define CFG_BASS_HYST    CONFIG_SONICSYNC_BASS_GATE_HYSTERESIS_DB
+#define CFG_BASS_CONFIRM CONFIG_SONICSYNC_BASS_CONFIRM_MS
+#define CFG_BASS_CAL_MS  CONFIG_SONICSYNC_BASS_CALIBRATION_MS
+#define CFG_BASS_MARGIN  CONFIG_SONICSYNC_BASS_NOISE_MARGIN_DB
+#define CFG_VOICE_SENS   CONFIG_SONICSYNC_VOICE_SENSITIVITY
+#define CFG_NORM_HEADROOM CONFIG_SONICSYNC_NORMALIZE_HEADROOM_DB
+#define CFG_NORM_ATTACK CONFIG_SONICSYNC_NORMALIZE_ATTACK_MS
+#define CFG_NORM_RELEASE CONFIG_SONICSYNC_NORMALIZE_RELEASE_MS
+
+#define BLOCK_MS (1000.0f * CFG_FFT_N / CFG_SAMPLE_RATE)
+#define BASE_REFERENCE_DB ((float)CFG_GATE_DB + CFG_SPAN_DB)
+#define BASS_CAL_FRAMES \
+    ((CFG_BASS_CAL_MS * CFG_SAMPLE_RATE + 1000U * CFG_FFT_N - 1U) / \
+     (1000U * CFG_FFT_N))
 
 /* 12-bit LEDC resolution: duty range 0..4095 */
 #define LED_DUTY_MAX 4095
@@ -200,14 +215,24 @@ static float   s_im[CFG_FFT_N];
 static float   s_win[CFG_FFT_N];
 static float   s_window_power;
 
-static float s_env_bass_db  = -120.0f;   /* smoothed level envelopes (dB) */
-static float s_env_voice_db = -120.0f;
+static float s_env_voice_db = -120.0f; /* green brightness envelope (dB) */
 static bool  s_bass_on      = false;    /* noise gate states */
 static bool  s_voice_on     = false;
 static bool  s_music_on     = false;    /* music/silence state (logging) */
 
 static float s_attack_coef;             /* per-block smoothing coefficients */
 static float s_release_coef;
+
+/* Detection uses raw dBFS. Normalization changes green's display range only. */
+static uint16_t s_bass_histogram[121]; /* -120..0 dBFS, bounded RAM */
+static uint32_t s_bass_cal_count;
+static bool s_bass_calibrated;
+static float s_bass_noise_db;
+static float s_bass_gate_db;
+static unsigned s_bass_confirm_count;
+static float s_reference_db;
+static float s_norm_attack_coef, s_norm_release_coef;
+static float s_noise_up_coef, s_noise_down_coef;
 
 static int s_bin_bass_lo, s_bin_bass_hi;    /* FFT bins per band */
 static int s_bin_voice_lo, s_bin_voice_hi;
@@ -409,10 +434,14 @@ static void band_bins_init(void)
 static void envelope_init(void)
 {
     float dt = (float)CFG_FFT_N / (float)CFG_SAMPLE_RATE;
-    s_attack_coef  = 1.0f - expf(-dt / ((float)CFG_ATTACK_MS / 1000.0f));
-    s_release_coef = 1.0f - expf(-dt / ((float)CFG_RELEASE_MS / 1000.0f));
-    ESP_LOGI(TAG, "Envelope: attack %d ms, release %d ms (coefs %.3f/%.3f)",
-             CFG_ATTACK_MS, CFG_RELEASE_MS, (double)s_attack_coef,
+    s_attack_coef  = 1.0f - expf(-dt / ((float)CFG_VOICE_ATTACK_MS / 1000.0f));
+    s_release_coef = 1.0f - expf(-dt / ((float)CFG_VOICE_RELEASE_MS / 1000.0f));
+    s_norm_attack_coef = 1.0f - expf(-dt / ((float)CFG_NORM_ATTACK / 1000.0f));
+    s_norm_release_coef = 1.0f - expf(-dt / ((float)CFG_NORM_RELEASE / 1000.0f));
+    s_noise_up_coef = 1.0f - expf(-dt / 10.0f);
+    s_noise_down_coef = 1.0f - expf(-dt / 0.5f);
+    ESP_LOGI(TAG, "Green speech envelope: attack %d ms, release %d ms (coefs %.3f/%.3f)",
+             CFG_VOICE_ATTACK_MS, CFG_VOICE_RELEASE_MS, (double)s_attack_coef,
              (double)s_release_coef);
 }
 
@@ -450,6 +479,75 @@ static bool gate_pass(float db, bool *state)
     return *state;
 }
 
+static void bass_control_reset(void)
+{
+    memset(s_bass_histogram, 0, sizeof(s_bass_histogram));
+    s_bass_cal_count = s_bass_confirm_count = 0;
+    s_bass_calibrated = (BASS_CAL_FRAMES == 0);
+    s_bass_noise_db = -120.0f;
+    s_bass_gate_db = (float)CFG_GATE_DB + CFG_BASS_OFFSET;
+    s_reference_db = BASE_REFERENCE_DB;
+}
+
+/* Learn the 80th percentile of startup background, ignoring rare spikes. */
+static bool bass_gate_pass(float db)
+{
+    if (!s_bass_calibrated) {
+        int bin = (int)ceilf(fmaxf(-120.0f, fminf(0.0f, db))) + 120;
+        s_bass_histogram[bin]++;
+        s_bass_cal_count++;
+        if (s_bass_cal_count == BASS_CAL_FRAMES) {
+            uint32_t rank = (4U * s_bass_cal_count + 4U) / 5U;
+            uint32_t sum = 0;
+            for (int i = 0; i <= 120; i++) {
+                sum += s_bass_histogram[i];
+                if (sum >= rank) {
+                    s_bass_noise_db = (float)i - 120.0f;
+                    break;
+                }
+            }
+            s_bass_calibrated = true;
+            s_bass_gate_db = fmaxf((float)CFG_GATE_DB + CFG_BASS_OFFSET,
+                                  s_bass_noise_db + CFG_BASS_MARGIN);
+            ESP_LOGI(TAG, "Bass background calibrated: floor %.1f, gate %.1f dBFS",
+                     (double)s_bass_noise_db, (double)s_bass_gate_db);
+        }
+        return false;
+    }
+
+    float gate = fmaxf((float)CFG_GATE_DB + CFG_BASS_OFFSET,
+                      s_bass_noise_db + CFG_BASS_MARGIN);
+    bool was_on = s_bass_on;
+    if (was_on) {
+        if (db < gate) s_bass_on = false;
+    } else if (db > gate + CFG_BASS_HYST) {
+        s_bass_confirm_count++;
+        if ((float)s_bass_confirm_count * BLOCK_MS >= CFG_BASS_CONFIRM) {
+            s_bass_on = true;
+            s_bass_confirm_count = 0;
+        }
+    } else {
+        s_bass_confirm_count = 0;
+        float coef = db < s_bass_noise_db ? s_noise_down_coef : s_noise_up_coef;
+        s_bass_noise_db += coef * (db - s_bass_noise_db);
+    }
+    /* Freeze the noise floor during detected bass and candidate beats. */
+    s_bass_gate_db = gate;
+    return s_bass_on;
+}
+
+/* Green-only loud-music reference. Blue is a binary bass indicator. */
+static void normalization_update(float db_voice)
+{
+    float loudest = -120.0f;
+    if (s_voice_on) loudest = fmaxf(loudest, db_voice);
+    float target = fmaxf(BASE_REFERENCE_DB,
+                        fminf(0.0f, loudest + CFG_NORM_HEADROOM));
+    float coef = target > s_reference_db ? s_norm_attack_coef : s_norm_release_coef;
+    s_reference_db += coef * (target - s_reference_db);
+    s_reference_db = fmaxf(BASE_REFERENCE_DB, s_reference_db);
+}
+
 static void env_update(float *env, float target)
 {
     float coef = (target > *env) ? s_attack_coef : s_release_coef;
@@ -457,9 +555,10 @@ static void env_update(float *env, float target)
 }
 
 /* Envelope level -> PWM duty (0 when below gate, capped at max brightness). */
-static uint32_t map_brightness(float env_db)
+static uint32_t map_brightness(float env_db, float gate_db, int sensitivity)
 {
-    float frac = (env_db - (float)CFG_GATE_DB) / (float)CFG_SPAN_DB;
+    float span = fmaxf(6.0f, s_reference_db - gate_db);
+    float frac = (env_db - gate_db) / span;
     frac *= (float)CFG_SENSITIVITY / 100.0f;
     if (frac <= 0.0f) {
         return 0;
@@ -467,7 +566,8 @@ static uint32_t map_brightness(float env_db)
     if (frac > 1.0f) {
         frac = 1.0f;
     }
-    frac = powf(frac, (float)CFG_GAMMA / 100.0f);
+    /* Lower channel sensitivity dims mid levels but preserves frac=1. */
+    frac = powf(frac, (float)CFG_GAMMA / (float)sensitivity);
     return (uint32_t)(frac * (float)CFG_MAX_BRIGHT + 0.5f);
 }
 
@@ -479,8 +579,8 @@ static void reset_audio_state(void)
     s_bass_on = false;
     s_voice_on = false;
     s_music_on = false;
-    s_env_bass_db = -120.0f;
     s_env_voice_db = -120.0f;
+    bass_control_reset();
     led_set(LED_GREEN, 0);
     led_set(LED_BLUE, 0);
 }
@@ -517,8 +617,14 @@ static void process_audio_block(void)
     float db_bass  = energy_to_db(e_bass);
     float db_voice = energy_to_db(e_voice);
 
-    s_bass_on  = gate_pass(db_bass, &s_bass_on);
+    s_bass_on  = bass_gate_pass(db_bass);
+    bool voice_was_on = s_voice_on;
     s_voice_on = gate_pass(db_voice, &s_voice_on);
+    if (s_voice_on && !voice_was_on) {
+        /* A new syllable starts from the gate, not the silent -120 dB floor. */
+        s_env_voice_db = CFG_GATE_DB;
+    }
+    normalization_update(db_voice);
 
     bool music = s_bass_on || s_voice_on;
     if (music && !s_music_on) {
@@ -528,22 +634,25 @@ static void process_audio_block(void)
     }
     s_music_on = music;
 
-    env_update(&s_env_bass_db,  s_bass_on  ? db_bass  : -120.0f);
     env_update(&s_env_voice_db, s_voice_on ? db_voice : -120.0f);
 
     /* A closed gate overrides smoothing immediately, including after music. */
-    uint32_t green = s_voice_on ? map_brightness(s_env_voice_db) : 0;
-    uint32_t blue  = s_bass_on  ? map_brightness(s_env_bass_db)  : 0;
+    uint32_t green = s_voice_on ? map_brightness(s_env_voice_db, CFG_GATE_DB,
+                                                CFG_VOICE_SENS) : 0;
+    /* Bass is explicitly 0/1: no envelope, gamma or volume normalization. */
+    uint32_t blue = s_bass_on ? CFG_MAX_BRIGHT : 0;
     led_set(LED_GREEN, green);
     led_set(LED_BLUE, blue);
 
     s_block_count++;
     if (s_block_count % (CFG_SAMPLE_RATE / CFG_FFT_N) == 0) {
-        ESP_LOGI(TAG, "bass %6.1f dBFS %s | voice %6.1f dBFS %s | "
-                 "green %4lu blue %4lu",
+        ESP_LOGI(TAG, "bass %.1f/%s floor %.1f gate %.1f | voice %.1f/%s | "
+                 "ref %.1f dBFS | green %lu blue %lu | bass-cal %lu/%lu",
                  (double)db_bass, s_bass_on ? "on" : "off",
+                 (double)s_bass_noise_db, (double)s_bass_gate_db,
                  (double)db_voice, s_voice_on ? "on" : "off",
-                 (unsigned long)green, (unsigned long)blue);
+                 (double)s_reference_db, (unsigned long)green, (unsigned long)blue,
+                 (unsigned long)s_bass_cal_count, (unsigned long)BASS_CAL_FRAMES);
     }
 }
 
@@ -559,6 +668,12 @@ static void log_config(void)
              (unsigned long)CFG_MAX_BRIGHT);
     ESP_LOGI(TAG, "FFT block %d samples, sample rate %d Hz",
              CFG_FFT_N, CFG_SAMPLE_RATE);
+    ESP_LOGI(TAG, "Blue BINARY 0/%lu; green response %d%%; bass offset %d dB, "
+             "hysteresis %d dB, confirm %d ms, calibration %d ms",
+             (unsigned long)CFG_MAX_BRIGHT, CFG_VOICE_SENS, CFG_BASS_OFFSET, CFG_BASS_HYST,
+             CFG_BASS_CONFIRM, CFG_BASS_CAL_MS);
+    ESP_LOGI(TAG, "Green loud-music reference: headroom %d dB, attack %d / release %d ms",
+             CFG_NORM_HEADROOM, CFG_NORM_ATTACK, CFG_NORM_RELEASE);
 }
 
 static void idle_forever(void)
@@ -605,6 +720,9 @@ void app_main(void)
     window_init();
     band_bins_init();
     envelope_init();
+    bass_control_reset();
+    ESP_LOGI(TAG, "Bass background learning for %d ms: keep music off briefly; "
+             "green remains active", CFG_BASS_CAL_MS);
     ESP_LOGI(TAG, "READY: audio capture active, waiting for music");
 
     for (;;) {

@@ -6,12 +6,13 @@ frequency analysis.
 
 | LED channel | Reacts to                     |
 |-------------|-------------------------------|
-| **Green**   | Voice-range energy (300–3400 Hz) |
-| **Blue**    | Bass energy (40–250 Hz)       |
+| **Green**   | Fast, graduated response to voice-range energy (300–3400 Hz) |
+| **Blue**    | Binary bass indicator (40–250 Hz): OFF or configured maximum |
 
-This is frequency-reactive lighting, not speech recognition: each channel's
-brightness simply tracks how much audio energy sits in its frequency band, so
-the light follows the music.
+This is frequency-reactive lighting, not speech recognition. Green follows
+speech-band level and articulation; other sounds in that band can trigger it.
+Blue switches on when bass passes its background-aware gate and switches off
+when the gate closes. Sustained bass holds blue on; it is not a timed strobe.
 
 ## Key features
 
@@ -23,10 +24,18 @@ the light follows the music.
   windowing in plain C; zero external DSP libraries.
 - **Noise gate with hysteresis** — silence keeps both LEDs fully dark, and
   hysteresis stops flicker at the threshold.
-- **Attack/release envelope smoothing** — the lights swell and fade musically
-  instead of strobing.
-- **Gamma-corrected brightness mapping** with sensitivity and max-brightness
-  limits per channel.
+- **Independent channel response** — blue uses a higher, background-aware
+  gate and a short trigger confirmation, then switches directly to the
+  configured brightness cap. Green keeps its voice threshold with a sharper
+  syllable response.
+- **Green loud-music normalization** — adapts green's upper reference during
+  loud voice-band passages. Blue stays binary and loud bass cannot dim green
+  through the normalizer. Quiet input is never amplified.
+- **Fast green speech envelope** — 15 ms attack / 90 ms release time constants
+  follow articulation. A qualifying new syllable responds on the first FFT
+  block rather than rising from the silent -120 dBFS floor.
+- **Green gamma-corrected brightness mapping** with sensitivity control;
+  both channels respect the configured maximum brightness.
 - **Failsafe startup** — LED outputs forced off at reset; the one-time
   readiness animation runs only after successful initialization, so a failed
   init never produces a successful-ready indication.
@@ -37,12 +46,14 @@ the light follows the music.
 
 ### Audio pipeline
 
-```
-INMP441 ──I2S──▶ DMA ──▶ 512-sample blocks (32 ms @ 16 kHz)
-   ──▶ DC removal + Hann window ──▶ 512-point FFT
-   ──▶ bass & voice band energy ──▶ dB level
-   ──▶ noise gate (+hysteresis) ──▶ attack/release envelope
-   ──▶ gamma mapping ──▶ 12-bit LEDC PWM (green GPIO18, blue GPIO19)
+```mermaid
+flowchart TD
+    Mic["INMP441 / mono I2S"] --> FFT["512-sample window and FFT"]
+    FFT --> Voice["Voice-band level and gate"]
+    FFT --> Bass["Bass background gate and confirmation"]
+    Voice --> Curve["Fast envelope and green normalization"]
+    Curve --> Green["Graduated green PWM"]
+    Bass --> Blue["Blue OFF or configured maximum"]
 ```
 
 **Capture.** The ESP32-C6 acts as I2S master and clocks the microphone
@@ -66,19 +77,53 @@ the default bands map to FFT bins 1–8 (bass, 40–250 Hz) and 10–109 (voice,
 **Levels and gating.** Signed PCM is divided by 8388608 before the FFT,
 giving samples in [-1, 1). One-sided band energy is converted to RMS power
 using `2 * energy / (FFT_size * sum(Hann_window_squared))`, then to dBFS.
-A full-scale sine is approximately -3.01 dBFS RMS. Each band has its own
-noise gate with hysteresis: the level
-must exceed `gate + hysteresis` to switch on and fall below the gate to
-switch off. Background noise below the chosen threshold is suppressed;
-the threshold still needs to suit the room. A closed gate immediately forces
-its PWM duty to zero, overriding any residual smoothed envelope.
+A full-scale sine is approximately -3.01 dBFS RMS. Green keeps its original
+-50 dBFS closing gate and -47 dBFS opening threshold. Blue's minimum gate
+is -40 dBFS, with 5 dB opening hysteresis and 64 ms of consecutive above-gate
+input before it activates. A closed gate immediately forces its PWM duty to
+zero, overriding any residual smoothed envelope.
 
-**Smoothing and mapping.** The gated level feeds attack/release exponential
-envelopes (60 ms up / 300 ms down by default). The smoothed level maps to a
-12-bit LEDC duty cycle through `(level − gate) / span × sensitivity`, clamped
-to [0, 1], raised to a gamma curve (1.8) and capped at the configured maximum
-brightness — the same loudness-to-display mapping used in audio metering, so
-perceived LED brightness tracks perceived loudness.
+**Bass background rejection.** After the readiness animation, blue stays
+off for 1.5 seconds while a bounded histogram measures the 80th percentile
+of the room's bass level. Keep music off for this short interval. Green is
+active throughout. Blue then uses the higher of its minimum gate and the
+learned background plus 8 dB. The background follows downward over quiet
+periods, rises slowly only while the bass gate is closed, and freezes during
+candidate or detected bass. Sustained music is therefore not continuously
+learned away as noise. A single 32 ms spike does not activate blue.
+
+This rejects steady background and brief spikes; it cannot identify every
+noise source. Real disturbances that are stronger and longer than the
+threshold can still look like bass. If music was already playing during
+calibration, pause it for a few seconds so the background estimate recovers.
+
+**Green speech response and mapping.** The gated voice level feeds a 15 ms
+attack / 90 ms release exponential envelope. A newly opened voice gate seeds
+the envelope at the gate level, so short syllables are visible immediately.
+The output still updates once per FFT block (32 ms at the default settings);
+15 ms is an envelope time constant, not a faster capture/update interval.
+The smoothed level maps to a
+12-bit LEDC duty cycle through `(level - channel_gate) / (reference - channel_gate)`
+(minimum span 6 dB), multiplied by master sensitivity and clamped to [0, 1].
+The curve exponent is `gamma_percent / green_response_percent`: green
+response 85 gives about 2.12. Lower response makes intermediate levels darker while retaining the
+configured full-brightness endpoint. The existing master sensitivity remains
+available as a separate multiplier. A closed voice gate forces green to zero
+on the next processed block, preserving clear gaps between words.
+
+**Binary bass output.** Once bass qualifies, blue duty is exactly
+`SONICSYNC_MAX_BRIGHTNESS` (4095 by default). When its gate is closed, duty
+is exactly zero. There is no intermediate brightness, envelope fade, gamma
+or volume normalization on blue. Background calibration, hysteresis and
+64 ms confirmation remain in place to limit unwanted flicker.
+
+**Green loud-music normalization.** The normal upper reference is -12 dBFS (base
+gate -50 plus span 38). Only active, noise-gated voice-band input can raise it,
+toward its level plus 3 dB headroom, capped at 0 dBFS. It rises over a 150 ms
+time constant and recovers over 4 seconds. It never drops below the normal
+reference, so it cannot boost quiet input or turn a rejected background into
+music. This changes the LED display range only; microphone/ADC clipping
+cannot be repaired by a brightness algorithm.
 
 ## Behavior
 
@@ -96,6 +141,10 @@ On every cold power-on or restart:
 4. Both LEDs turn OFF; audio capture is already running; the firmware waits
    for music and switches to audio-reactive lighting automatically when music
    is detected.
+5. For the first 1.5 seconds after the animation, keep music off while blue
+   learns the background. Green is active during this interval. The console
+   announces when bass background calibration finishes. The animation does
+   not replay.
 
 The animation runs **exactly once per boot** — it is never looped while
 waiting and never replayed when music starts or stops. If initialization
@@ -109,10 +158,11 @@ console.
 - **Silence keeps both LEDs off.** Noise-gated levels below the threshold
   always force duty 0, including on the first quiet block after music.
 - Capture errors or timeouts clear both outputs and reset the gate/envelope
-  states. Reads have a finite timeout based on block duration.
-- Music drives each channel independently from its own band, smoothing and
-  gate state, so bass drops and vocal passages are visible on their own
-  channel.
+  states, normalization reference and bass background learning. The readiness
+  animation does not replay. Reads have a finite timeout based on block duration.
+- Green follows speech-band levels with its fast envelope and graduated
+  brightness. Blue is OFF or the configured cap according to bass presence;
+  sustained above-gate bass holds it ON.
 
 ## Hardware
 
@@ -163,12 +213,21 @@ under **SonicSync32 Configuration**. Defaults:
 | Bass band                     | 40–250 Hz | Blue channel band |
 | Voice band                    | 300–3400 Hz | Green channel band |
 | FFT size                      | 512     | Block length (power of two) |
-| Noise gate                    | −50 dBFS RMS | Band silence threshold |
-| Gate hysteresis               | 3 dB    | Anti-flicker |
-| Span (gate → full brightness) | 38 dB   | Dynamic range |
-| Sensitivity                   | 100 %   | Brightness multiplier |
+| Base/green gate               | −50 dBFS RMS | Green closing threshold |
+| Green gate hysteresis         | 3 dB    | Green opening threshold is -47 dBFS |
+| Bass gate offset              | +10 dB  | Minimum blue closing gate is -40 dBFS |
+| Bass gate hysteresis          | 5 dB    | Quiet-baseline opening threshold is -35 dBFS |
+| Bass trigger confirmation     | 64 ms   | Reject isolated one-frame spikes |
+| Bass startup calibration      | 1500 ms | Keep music off briefly after the animation |
+| Bass background margin        | 8 dB    | Minimum difference above learned background |
+| Blue output                   | 0 / configured cap | Binary, no brightness graduation |
+| Green response                | 85 % | Darker intermediate levels, full endpoint retained |
+| Base span                     | 38 dB   | Normal upper reference = base gate + span |
+| Green master sensitivity      | 100 %   | Green brightness multiplier; blue bypasses it |
+| Normalization headroom        | 3 dB    | Above the loudest active band |
+| Normalization attack/release   | 150 / 4000 ms | Smooth loud-section adjustment/recovery |
 | Gamma                         | 180 %   | Perceptual curve exponent |
-| Attack / release              | 60 / 300 ms | Envelope smoothing |
+| Green attack / release        | 15 / 90 ms | Faster speech articulation |
 | Max brightness                | 4095    | 12-bit PWM full scale |
 | Animation brightness          | 1023    | Readiness blink level |
 | LED PWM frequency             | 1000 Hz | Driver PWM |
@@ -178,11 +237,21 @@ Persistent overrides can also go in `sdkconfig.defaults.esp32c6`.
 ### Tuning tips
 
 - At the default Info log level, the console prints bass/voice levels in
-  dBFS, gate states and green/blue PWM duties about once per second. Use
-  these measurements to set the noise gate; startup blinks alone do not
-  verify the audio path.
-- If LEDs never light, lower the gate (more negative) and/or raise
-  sensitivity. If they flicker on room noise, raise the gate.
+  dBFS, bass background/gate, normalization reference, calibration progress
+  and green/blue PWM duties about once per second.
+- For residual blue flicker, inspect its learned floor and gate. Adjust the
+  **bass** margin, offset or confirmation time independently; do not raise
+  the base gate just to fix blue, since it would also suppress green.
+- For darker/brighter green intermediate levels, change the green response
+  percentage. Blue always uses the configured maximum as its ON state.
+  Detection thresholds and green brightness response are separate controls.
+- Green's new attack/release options supersede the old general envelope
+  settings. Old saved values remain accepted but are hidden and inactive;
+  new speech timing defaults apply without deleting the generated sdkconfig.
+- On an existing checkout, new Kconfig options acquire their defaults during
+  configuration. Preserve existing board/pin settings; there is no need to
+  delete the entire generated sdkconfig. The serial startup summary confirms
+  the values actually compiled into a build.
 - If bass reaction is weak, verify the audio actually contains bass; the
   band edges are configurable.
 
@@ -245,7 +314,69 @@ pio device monitor -p COMx -b 115200
 
 ## Verification status
 
-### Software correction: both LEDs stay on after readiness
+### Sharp speech and binary bass response (new)
+
+The new software checks compile the real firmware with simulated I2S/LEDC
+peripherals and run it on the host PC. This machine ran them with Clang
+22.1.8 on Windows (MSVC 14.44 CRT libraries; UBSan omitted because its
+Windows runtime needs extra libraries — the remaining compile flags are
+identical, `-Werror` included). The deployed `d06ac03` code responds to a
+sustained 125 Hz background fixture at -33.47 dBFS with blue duty 915. After
+learning that background, this tuning keeps blue at zero, while a stronger
+bass signal still activates it and voice remains responsive. The board
+defaults also retain the verified 16 MB flash choice for fresh checkouts,
+rather than relying on an excluded generated sdkconfig.
+
+| Tuning check | Host result |
+|--------------|-------------|
+| ESP32-C6 target build, Espressif32 7.0.1 / ESP-IDF 6.0.1 | PASS — firmware.bin 213,536 bytes; 16 MB flash setting retained |
+| Learned steady bass background | PASS — blue stays off, green still responds to voice |
+| Isolated 32 ms bass spikes | PASS — rejected; a 64 ms above-threshold hit responds |
+| Startup calibration | PASS — blue off while learning; green active |
+| Sustained bass after a quiet calibration | PASS — remains detected, not learned away |
+| Green intermediate brightness | PASS — quieter/darker, monotonic graduation to full scale |
+| Same 0.1-peak 125 Hz test signal | Blue duty 4095 when confirmed, zero when its gate closes |
+| Same 0.1-peak 1 kHz test signal | Green duty 1984, versus 2212 before tuning |
+| First qualifying voice block | PASS — green duty 1519 on the first 32 ms block, versus steady duty 1984 |
+| Speech articulation | PASS — short speech-band bursts respond; quieter syllables release within 96 ms and gaps force OFF |
+| Bass hits at several volumes | PASS — only duty 0 or configured cap; no intermediate blue values |
+| Loud mixed music fixture | PASS — green retains headroom (3514); blue remains binary (4095) |
+| Normalization recovery | PASS — slow recovery, no quiet boost, immediate gated silence-to-OFF |
+| Loud rejected bass background | PASS — cannot dim green via normalization |
+| Loud detected bass | PASS — also cannot dim green via its voice-only normalizer |
+| Music accidentally playing during calibration | PASS — recovers after a quiet interval |
+| Calibration/confirmation configured to zero | PASS — optional bypass works |
+| Readiness animation / C6 RX / failure-to-OFF | PASS — preserved by regression tests |
+
+The on-board results for this firmware are in the next section, measured on
+the project board (CH343 bridge, COM6) on 2026-11-09.
+
+### On-board measurements: sharp voice / binary bass firmware (2026-11-09)
+
+Build, flash and a full audio test session on the project's ESP32-C6
+(CH343 bridge, COM6 — the same board as the d06ac03 captures below):
+
+| Check | Result |
+|-------|--------|
+| Build (Espressif32 7.0.1 / ESP-IDF 6.0.1) | **PASS** — `firmware.bin` 213,536 bytes; 16 MB flash setting retained |
+| Chip identification (`esptool flash_id`) | ESP32-C6 (QFN40) rev v0.2, 40 MHz crystal, 16 MB flash — matches the previous board |
+| Flash + verify | **PASS** — bootloader 22,544 B, partition table 3,072 B, app 213,536 B; all hashes verified by esptool |
+| Boot: init → readiness animation → READY | **PASS** — captured on serial; animation 5.4 s (log timestamps 324 ms → 5734 ms), ends with both duties 0 |
+| Compiled voice envelope | **PASS** — startup log: `attack 15 ms, release 90 ms (coefs 0.882/0.299)`; separate Kconfig keys, legacy 60/300 ms values inactive |
+| Blue startup summary | **PASS** — startup log: `Blue BINARY 0/4095; green response 85%; bass offset 10 dB, hysteresis 5 dB, confirm 64 ms, calibration 1500 ms` |
+| Quiet 1.5 s after the startup blinks | **PASS** — music kept off during the unchanged 18-flash animation and calibration; log: `Bass background calibrated: floor -44.0, gate -36.0 dBFS` |
+| Talking → green responds | **PASS** — graduated duties track voice level: voice -29.6 dBFS → green 1047, -33.4 → 673, -37.6 → 469, -48.3 → 117, -49.0 → 67; blue stayed 0 |
+| Bass hits → blue responds | **PASS** — bass -23.5 dBFS → blue 4095 (green 0); gate close → 0. Blue duty was exactly 0 or 4095 in all 238 captured per-second status lines, never intermediate |
+| Sustained bass | **PASS** — blue held 4095 while bass stayed above its background-aware gate (54 blue-on events in the session) |
+| Mixed/loud music | **PASS** — simultaneous bass -32.0 dBFS and voice -33.0 dBFS → green 1579 + blue 4095; voice-dominant loud passage (voice -24.9 dBFS, bass below gate) → green 2164 (session max), blue 0 |
+| Silence → outputs off | **PASS** — both duties 0 whenever both bands fell below their gates; `Silence -> LEDs off` transitions logged throughout |
+| Physical session | Audio provided by the user: talking, bass hits, sustained bass, loud mixed music, then silence, with the board live on COM6 |
+
+The serial capture includes the full ROM + app boot, the readiness animation
+window, the 1500 ms calibration and the whole test session; sample lines are
+in the serial-output section below.
+
+### Prior correction: both LEDs stay on after readiness
 
 The original firmware shifted the PCM words but did not divide the signed
 24-bit counts by full scale. That inflated levels by about 138.47 dB and
@@ -260,10 +391,10 @@ and LEDC peripherals. On the original code, quiet nonzero test noise produces
 | Host check | Result |
 |------------|--------|
 | Digital silence, quiet noise and DC offset | PASS — both duties 0 |
-| 125 Hz tone | PASS — blue only; quieter tone gives lower duty |
+| 125 Hz tone | PASS — blue only, now binary at the configured cap |
 | 1000 Hz tone, including partial I2S reads | PASS — green only |
 | Mixed tones followed by quiet input | PASS — both on, then both off on the next block |
-| Gate opening/closing hysteresis | PASS — -47/-50 dBFS at defaults |
+| Gate opening/closing hysteresis | PASS — green retains -47/-50 dBFS; blue is independently tuned above |
 | Capture timeout/empty read | PASS — PWM, gates and envelopes reset |
 | RX configuration | PASS — 32-bit mono left, 32-bit slots |
 | Readiness animation | PASS — 18 flashes, no overlap, 5.4 seconds, ends off |
@@ -282,7 +413,7 @@ follow below.
 I2S references: [ESP-IDF 6.0.1 ESP32-C6 RX format](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c6/api-reference/peripherals/i2s.html#std-rx-mode)
 and [INMP441 data interface](https://invensense.tdk.com/wp-content/uploads/2015/02/INMP441.pdf).
 
-### Corrected firmware observations on hardware (serial console)
+### Previously deployed d06ac03 observations on hardware (serial console)
 
 Measured on the project's ESP32-C6 (CH343 bridge, COM6) with the corrected
 firmware; levels are the per-second console values in dBFS.
@@ -293,8 +424,8 @@ firmware; levels are the per-second console values in dBFS.
 | Cold boot → readiness animation → READY | **PASS** — animation 5.42 s (log timestamps 302 ms → 5722 ms), ends with both duties 0 |
 | Level scaling | Corrected — ambient input now reads −22.5 to −55.4 dBFS (was inflated ~138 dB by raw PCM counts) |
 | Stuck-LEDs symptom | Gone — duties track measured levels and gate states; outputs are no longer pinned at maximum |
-| Quiet input → green=0 blue=0 | Not achieved in this room — ambient bass-band noise at the mic (−22.5 to −51.8 dBFS) exceeds the −50 dBFS gate, so blue responds to real acoustic noise (duty 0–1896); green stayed 0 |
-| Bass audio → blue responds | Blue follows bass-band energy proportionally (observed duties 0–1896 tracking −22.5 to −51.8 dBFS). A 125 Hz PC-speaker tone added no clear delta above ambient (speaker bass rolloff) |
+| Quiet input → green=0 blue=0 | Not achieved — background bass-band input (−22.5 to −51.8 dBFS) exceeded the shared −50 dBFS gate; blue duty 0–1896 and green 0. The background source was not isolated |
+| Bass audio → blue responds | Blue followed bass-band energy (duties 0–1896). A 125 Hz PC-speaker tone added no clear delta above background; its cause was not isolated |
 | Voice audio → green responds | Partial — a 1 kHz PC-speaker tone lifted the voice band from ≈ −52.4 to ≈ −48.9 dBFS and opened the gate briefly (green duties 17 and 1). Speaker level at the mic is too low to hold the gate open; a louder/closer source is needed for a full check |
 | Audio stops → outputs return to zero | **PASS for green** — voice band fell back below the gate and green returned to 0 after the tone. Blue returns to 0 whenever ambient bass drops below the gate, then re-opens on ambient noise |
 
@@ -312,15 +443,57 @@ firmware; levels are the per-second console values in dBFS.
 | Silence → LEDs-off transition | Failed in user observation — both external LEDs stayed on after readiness |
 | Space-free build via `pio.ps1` junction | **PASS** — no whitespace error |
 
-### Awaiting physical confirmation
+### Physical confirmation status
 
 | Check | Status |
 |-------|--------|
-| Readiness blink pattern seen on the LEDs | User confirmed the startup blinks on the original firmware; the corrected build keeps the identical animation (verified in host tests and boot-log timing) |
-| LED brightness visually following music | Pending |
+| Readiness blink pattern seen on the LEDs | Confirmed — the unchanged 18-flash animation ran live on the board during the 2026-11-09 session (boot-log timing 5.4 s; host tests verify 18 flashes, ends off) |
+| LED brightness following voice and bass | Confirmed on-board — green follows voice with graduated duties (0–2164 observed), blue switches only between 0 and the configured cap 4095; silence returns both to 0 |
 | Full-power 20 W LED run at 12 V | Pending — LED driver board and current limiting to be verified first |
 
 ## Serial output on boot
+
+### Current firmware — sharp voice / binary bass (on-board capture, 2026-11-09)
+
+Captured on COM6 with the release build flashed from this checkout:
+
+```
+ESP-ROM:esp32c6-20220919
+Build:Sep 19 2022
+rst:0x1 (POWERON),boot:0xc (SPI_FAST_FLASH_BOOT)
+I (23) boot: ESP-IDF 6.0.1 2nd stage bootloader
+I (31) boot.esp32c6: SPI Speed      : 80MHz
+I (35) boot.esp32c6: SPI Mode       : DIO
+I (35) boot.esp32c6: SPI Flash Size : 16MB
+I (264) SonicSync32: === SonicSync32 boot (ESP32-C6 + INMP441 I2S) ===
+I (274) SonicSync32: Gate -50 dBFS (+3 dB hysteresis), span 38 dB, sensitivity 100%, gamma 1.80, max brightness 4095
+I (284) SonicSync32: FFT block 512 samples, sample rate 16000 Hz
+I (284) SonicSync32: Blue BINARY 0/4095; green response 85%; bass offset 10 dB, hysteresis 5 dB, confirm 64 ms, calibration 1500 ms
+I (294) SonicSync32: Green loud-music reference: headroom 3 dB, attack 150 / release 4000 ms
+I (304) SonicSync32: LEDs: green=GPIO18 blue=GPIO19, PWM 1000 Hz, 12-bit
+I (314) SonicSync32: I2S: BCLK=GPIO6 WS=GPIO7 SD=GPIO10, 16000 Hz, 32-bit RX words (24-bit mic), mono left
+I (324) SonicSync32: Initialization OK — running one-time readiness animation
+I (334) SonicSync32: Readiness animation: green x3, blue x3, 3 rounds, 150 ms on/off, brightness 1023
+I (5734) SonicSync32: Bands: bass 40-250 Hz (bins 1-8), voice 300-3400 Hz (bins 10-109)
+I (5734) SonicSync32: Green speech envelope: attack 15 ms, release 90 ms (coefs 0.882/0.299)
+I (5744) SonicSync32: Bass background learning for 1500 ms: keep music off briefly; green remains active
+I (5754) SonicSync32: READY: audio capture active, waiting for music
+I (7094) SonicSync32: Bass background calibrated: floor -44.0, gate -36.0 dBFS
+```
+
+Once per second the running firmware prints measured band levels, the learned
+bass `floor`, the effective bass `gate`, the normalization `ref` and the
+green/blue PWM duties. Highlights from the test session (talking, bass hits,
+sustained bass, loud music, silence):
+
+```
+I (103794) SonicSync32: bass -23.5/on floor -46.4 gate -38.4 | voice -52.3/off | ref -12.0 dBFS | green 0 blue 4095 | bass-cal 47/47   (bass hit)
+I (107764) SonicSync32: bass -32.0/on floor -45.8 gate -37.8 | voice -33.0/on | ref -12.0 dBFS | green 1579 blue 4095 | bass-cal 47/47 (bass + voice together)
+I (127604) SonicSync32: bass -34.7/off floor -43.9 gate -35.9 | voice -24.9/on | ref -12.0 dBFS | green 2164 blue 0 | bass-cal 47/47   (loud voice-band music)
+I (170254) SonicSync32: bass -45.9/off floor -44.8 gate -36.7 | voice -29.6/on | ref -12.0 dBFS | green 1047 blue 0 | bass-cal 47/47   (talking)
+```
+
+Blue was 0 or 4095 in every one of the 238 captured status lines.
 
 ### Original firmware (before correction)
 
@@ -340,7 +513,7 @@ I (5722) SonicSync32: READY: audio capture active, waiting for music
 I (5742) SonicSync32: Music detected -> audio-reactive lighting active
 ```
 
-### Corrected firmware (on-board capture)
+### Previously deployed d06ac03 (on-board capture)
 
 ```
 I (262) SonicSync32: === SonicSync32 boot (ESP32-C6 + INMP441 I2S) ===
@@ -355,13 +528,18 @@ I (5722) SonicSync32: Envelope: attack 60 ms, release 300 ms (coefs 0.413/0.101)
 I (5732) SonicSync32: READY: audio capture active, waiting for music
 ```
 
-Once per second the corrected firmware also prints measured band levels and
-PWM duties, e.g.:
+Once per second that previous firmware printed measured band levels and PWM
+duties, e.g.:
 
 ```
 I (10522) SonicSync32: bass  -34.8 dBFS on | voice  -49.3 dBFS off | green    0 blue  409
 I (16472) SonicSync32: bass  -52.1 dBFS off | voice  -52.2 dBFS off | green    0 blue    0
 ```
+
+The new tuning additionally reports `floor`, the effective bass `gate`, the
+normalization `ref`, and `bass-cal` progress. These are essential for checking
+the new calibration on the actual microphone; the on-board capture from
+2026-11-09 is shown at the top of this section.
 
 
 ## Project layout

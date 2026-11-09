@@ -2,3 +2,4 @@
 # Application tuning values live in src/Kconfig.projbuild
 # ("SonicSync32 Configuration" menu).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

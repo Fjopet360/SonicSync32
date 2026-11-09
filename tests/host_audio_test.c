@@ -143,7 +143,10 @@ static esp_err_t i2s_channel_read(i2s_chan_handle_t h, void *dest,
 static void reset_fixture(void)
 {
     s_bass_on = s_voice_on = s_music_on = false;
-    s_env_bass_db = s_env_voice_db = -120.0f;
+#ifndef CFG_VOICE_ATTACK_MS
+    s_env_bass_db = -120.0f;
+#endif
+    s_env_voice_db = -120.0f;
     s_block_count = 0;
     duty[0] = duty[1] = 0;
     read_error = read_empty = false;
@@ -152,6 +155,9 @@ static void reset_fixture(void)
     window_init();
     band_bins_init();
     envelope_init();
+#ifdef CFG_BASS_OFFSET
+    bass_control_reset();
+#endif
 }
 
 /* Fixture data follows the mic contract: signed 24-bit PCM in bits 31:8. */
@@ -172,6 +178,9 @@ static void frames(unsigned count)
         input_pos = 0;
         process_audio_block();
         assert(duty[0] <= CFG_MAX_BRIGHT && duty[1] <= CFG_MAX_BRIGHT);
+#ifdef CFG_VOICE_ATTACK_MS
+        assert(duty[1] == 0 || duty[1] == CFG_MAX_BRIGHT);
+#endif
     }
 }
 
@@ -185,8 +194,46 @@ static void quiet_noise(void)
     }
 }
 
+static void warm_up_quiet(void)
+{
+    quiet_noise();
+#ifdef CFG_BASS_OFFSET
+    frames(BASS_CAL_FRAMES);
+#endif
+}
+
 int main(int argc, char **argv)
 {
+#ifdef CFG_BASS_OFFSET
+    if (argc > 1 && !strcmp(argv[1], "--speech-probe")) {
+        reset_fixture();
+        warm_up_quiet();
+        tones(0, 0.1f, 0);
+        frames(1);
+        uint32_t first = duty[0];
+        frames(59);
+        uint32_t steady = duty[0];
+        tones(0, 0.01f, 0);
+        frames(3);
+        printf("Speech response: first 32 ms block=%u, steady=%u, "
+               "after 96 ms quieter speech=%u\n", first, steady, duty[0]);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--config-smoke")) {
+        reset_fixture();
+        warm_up_quiet();
+        assert(s_bass_calibrated);
+        tones(0.1f, 0.1f, 0);
+        frames(60);
+        assert(duty[0] > 0 && duty[1] > 0);
+        quiet_noise();
+        frames(1);
+        assert(!duty[0] && !duty[1]);
+        assert(s_reference_db >= BASE_REFERENCE_DB);
+        puts("PASS: configurable calibration/confirmation bypass and silence-to-OFF");
+        return 0;
+    }
+#endif
     /* First test reproduces the reported fault on the original source. */
     reset_fixture();
     quiet_noise();
@@ -202,6 +249,16 @@ int main(int argc, char **argv)
     }
     assert(!duty[0] && !duty[1] && !s_bass_on && !s_voice_on);
 
+    if (argc > 1 && !strcmp(argv[1], "--reproduce-ambient")) {
+        reset_fixture();
+        tones(0.03f, 0, 0);
+        frames(100);
+        printf("Sustained background bass: green=%u blue=%u\n", duty[0], duty[1]);
+        assert(duty[1] > 0);
+        puts("REPRODUCED: original shared gate lights blue on background hum");
+        return 0;
+    }
+
     reset_fixture();
     frames(10);
     assert(!duty[0] && !duty[1]);
@@ -214,22 +271,24 @@ int main(int argc, char **argv)
     puts("PASS: silence, quiet noise, unused low bits and DC offset stay off");
 
     reset_fixture();
+    warm_up_quiet();
     tones(0.1f, 0, 0);
     frames(60);
     float bass_db = energy_to_db(band_energy(s_bin_bass_lo, s_bin_bass_hi));
     assert(fabsf(bass_db - (-23.0103f)) < 0.1f);
-    assert(!duty[0] && duty[1] > 0 && duty[1] < CFG_MAX_BRIGHT);
-    uint32_t loud_blue = duty[1];
+    assert(!duty[0] && duty[1] == CFG_MAX_BRIGHT);
     printf("PASS: 125 Hz tone -> blue=%u green=0, level=%.2f dBFS\n",
            duty[1], bass_db);
 
     reset_fixture();
-    tones(0.01f, 0, 0);
+    warm_up_quiet();
+    tones(0.04f, 0, 0);
     frames(60);
-    assert(duty[1] > 0 && duty[1] < loud_blue && !duty[0]);
-    puts("PASS: quieter bass gives lower brightness");
+    assert(duty[1] == CFG_MAX_BRIGHT && !duty[0]);
+    puts("PASS: quieter accepted bass uses the same binary ON brightness");
 
     reset_fixture();
+    warm_up_quiet();
     tones(0, 0.1f, 0);
     read_chunk = 68; /* Exercise the real partial-read accumulation loop. */
     frames(60);
@@ -237,6 +296,7 @@ int main(int argc, char **argv)
     printf("PASS: 1000 Hz tone -> green=%u blue=0, including partial reads\n", duty[0]);
 
     reset_fixture();
+    warm_up_quiet();
     tones(0.1f, 0.1f, 0);
     frames(60);
     assert(duty[0] > 0 && duty[1] > 0);
@@ -247,37 +307,229 @@ int main(int argc, char **argv)
 
     reset_fixture();
     const float rms_to_peak = 1.41421356237f;
-    tones(rms_to_peak * powf(10, -48.0f / 20), 0, 0);
+    tones(0, rms_to_peak * powf(10, -48.0f / 20), 0);
     frames(60);
-    assert(!s_bass_on && !duty[1]);
-    tones(rms_to_peak * powf(10, -46.0f / 20), 0, 0);
+    assert(!s_voice_on && !duty[0]);
+    tones(0, rms_to_peak * powf(10, -46.0f / 20), 0);
     frames(60);
-    assert(s_bass_on && duty[1] > 0);
-    tones(rms_to_peak * powf(10, -48.0f / 20), 0, 0);
+    assert(s_voice_on && duty[0] > 0);
+    tones(0, rms_to_peak * powf(10, -48.0f / 20), 0);
     frames(1);
-    assert(s_bass_on);
-    tones(rms_to_peak * powf(10, -51.0f / 20), 0, 0);
+    assert(s_voice_on);
+    tones(0, rms_to_peak * powf(10, -51.0f / 20), 0);
     frames(1);
-    assert(!s_bass_on && !duty[1]);
-    puts("PASS: -47/-50 dBFS opening/closing hysteresis");
+    assert(!s_voice_on && !duty[0]);
+    puts("PASS: green retains -47/-50 dBFS opening/closing hysteresis");
 
+    warm_up_quiet();
     tones(0.1f, 0.1f, 0);
     frames(60);
     read_error = true;
     frames(1);
     assert(!duty[0] && !duty[1] && !s_bass_on && !s_voice_on && !s_music_on);
-    assert(s_env_bass_db == -120.0f && s_env_voice_db == -120.0f);
+    assert(s_env_voice_db == -120.0f);
+#ifndef CFG_VOICE_ATTACK_MS
+    assert(s_env_bass_db == -120.0f);
+#endif
     assert(last_timeout_ms < 1000 && last_timeout_ms >= 32);
     read_error = false;
     quiet_noise();
     frames(1);
     assert(!duty[0] && !duty[1]);
+    warm_up_quiet();
     tones(0.1f, 0.1f, 0);
     frames(60);
     read_empty = true;
     frames(1);
     assert(!duty[0] && !duty[1] && !s_music_on);
     puts("PASS: timeout/empty capture clears PWM, gates and envelopes");
+
+#ifdef CFG_BASS_OFFSET
+    reset_fixture();
+    tones(0, 0.1f, 0);
+    frames(20);
+    assert(!s_bass_calibrated && !duty[1] && duty[0] > 0);
+    puts("PASS: blue stays dark during background calibration; green works");
+
+    reset_fixture();
+    /* A steady low-frequency background at -33.47 dBFS fooled the old gate. */
+    tones(0.03f, 0, 0);
+    frames(BASS_CAL_FRAMES + 100);
+    assert(s_bass_calibrated && !s_bass_on && !duty[1] && !duty[0]);
+    assert(s_bass_gate_db > -30.0f);
+    /* Voice should remain useful even with bass background present. */
+    tones(0.03f, 0.1f, 0);
+    frames(100);
+    assert(!duty[1] && duty[0] > 0);
+    tones(0.4f, 0.1f, 0);
+    frames(60);
+    assert(duty[1] > 0 && duty[0] > 0);
+    tones(0.03f, 0, 0);
+    frames(1);
+    assert(!duty[1] && !duty[0]);
+    puts("PASS: learned hum suppressed, stronger bass detected, voice preserved");
+
+    reset_fixture();
+    warm_up_quiet();
+    for (int burst = 0; burst < 20; burst++) {
+        tones(0.1f, 0, 0);
+        frames(1);
+        assert(!s_bass_on && !duty[1]);
+        quiet_noise();
+        frames(1);
+    }
+    tones(0.1f, 0, 0);
+    frames(2);
+    assert(s_bass_on && duty[1] > 0);
+    puts("PASS: isolated 32 ms spikes rejected; a 64 ms bass hit responds");
+
+    reset_fixture();
+    warm_up_quiet();
+    tones(rms_to_peak * powf(10, -38.0f / 20), 0, 0);
+    frames(60);
+    assert(!s_bass_on && !duty[1]);
+    tones(rms_to_peak * powf(10, -34.0f / 20), 0, 0);
+    frames(60);
+    assert(s_bass_on && duty[1] > 0);
+    tones(rms_to_peak * powf(10, -38.0f / 20), 0, 0);
+    frames(1);
+    assert(s_bass_on);
+    tones(rms_to_peak * powf(10, -41.0f / 20), 0, 0);
+    frames(1);
+    assert(!s_bass_on && !duty[1]);
+    puts("PASS: blue has its own -35/-40 dBFS hysteresis at a quiet baseline");
+
+    reset_fixture();
+    warm_up_quiet();
+    float noise_before_music = s_bass_noise_db;
+    tones(0.4f, 0, 0);
+    frames(600);
+    assert(duty[1] > 0 && s_bass_on && s_bass_noise_db == noise_before_music);
+    puts("PASS: sustained bass remains active; music is not learned as noise");
+
+    reset_fixture();
+    s_reference_db = BASE_REFERENCE_DB;
+    uint32_t previous = 0;
+    for (int step = 0; step <= 100; step++) {
+        float db = CFG_GATE_DB + (BASE_REFERENCE_DB - CFG_GATE_DB) * step / 100.0f;
+        uint32_t next = map_brightness(db, CFG_GATE_DB, CFG_VOICE_SENS);
+        assert(next >= previous && next <= CFG_MAX_BRIGHT);
+        previous = next;
+    }
+    assert(previous == CFG_MAX_BRIGHT);
+    float midpoint = (CFG_GATE_DB + BASE_REFERENCE_DB) / 2.0f;
+    uint32_t old_mid = map_brightness(midpoint, CFG_GATE_DB, 100);
+    uint32_t green_mid = map_brightness(midpoint, CFG_GATE_DB, CFG_VOICE_SENS);
+    assert(green_mid < old_mid);
+    printf("PASS: green retains 0..full graduation, mid-level old=%u green=%u\n",
+           old_mid, green_mid);
+
+    reset_fixture();
+    warm_up_quiet();
+    tones(0.45f, 0.45f, 0); /* Combined peak below 1.0; no ADC clipping. */
+    frames(300);
+    assert(s_reference_db > BASE_REFERENCE_DB && s_reference_db <= 0);
+    assert(duty[0] > 0 && duty[0] < CFG_MAX_BRIGHT);
+    assert(duty[1] == CFG_MAX_BRIGHT);
+    float loud_reference = s_reference_db;
+    uint32_t party_green = duty[0], party_blue = duty[1];
+    tones(0.1f, 0.1f, 0);
+    frames(30);
+    assert(duty[0] < party_green && duty[1] == party_blue);
+    assert(s_reference_db > BASE_REFERENCE_DB && s_reference_db < loud_reference);
+    quiet_noise();
+    frames(1);
+    assert(!duty[0] && !duty[1]);
+    float prior_reference = s_reference_db;
+    frames(300);
+    assert(s_reference_db >= BASE_REFERENCE_DB && s_reference_db < prior_reference);
+    assert(!duty[0] && !duty[1]);
+    printf("PASS: loud music normalizes green=%u while blue stays binary=%u; "
+           "slow recovery never boosts silence\n", party_green, party_blue);
+    read_error = true;
+    frames(1);
+    assert(s_reference_db == BASE_REFERENCE_DB && !s_bass_calibrated);
+    assert(s_bass_cal_count == 0 && !duty[0] && !duty[1]);
+    puts("PASS: capture failure clears adaptive reference and restarts background learning");
+
+    reset_fixture();
+    tones(0.5f, 0, 0);
+    frames(BASS_CAL_FRAMES + 60);
+    assert(!s_bass_on && !duty[1] && s_reference_db == BASE_REFERENCE_DB);
+    tones(0.5f, 0.1f, 0);
+    frames(60);
+    assert(duty[0] > 0 && !duty[1] && s_reference_db == BASE_REFERENCE_DB);
+    puts("PASS: rejected loud bass background cannot dim green via normalization");
+
+    reset_fixture();
+    tones(0.4f, 0, 0); /* Simulate music accidentally playing during calibration. */
+    frames(BASS_CAL_FRAMES + 60);
+    assert(!duty[1]);
+    quiet_noise();
+    frames(150);
+    tones(0.1f, 0, 0);
+    frames(60);
+    assert(duty[1] > 0);
+    puts("PASS: calibration during music recovers after a quiet interval");
+
+#ifdef CFG_VOICE_ATTACK_MS
+    reset_fixture();
+    warm_up_quiet();
+    tones(0, 0.1f, 0);
+    frames(1);
+    uint32_t first_syllable = duty[0];
+    assert(first_syllable > 0 && !duty[1]);
+    frames(59);
+    uint32_t steady_voice = duty[0];
+    assert(first_syllable > steady_voice * 7U / 10U);
+    tones(0, 0.01f, 0); /* Quieter voice still above the closing threshold. */
+    frames(3);
+    assert(duty[0] > 0 && duty[0] < steady_voice * 4U / 10U);
+    quiet_noise();
+    frames(1);
+    assert(!duty[0]);
+    printf("PASS: sharper speech onset first block=%u, steady=%u; "
+           "quieter syllable releases within 96 ms\n", first_syllable, steady_voice);
+
+    for (int word = 0; word < 10; word++) {
+        tones(0, rms_to_peak * powf(10, -46.0f / 20), 0);
+        frames(1);
+        assert(duty[0] > 0 && !duty[1]);
+        quiet_noise();
+        frames(1);
+        assert(!duty[0] && !duty[1]);
+    }
+    puts("PASS: short speech-band syllables trigger green without hanging across pauses");
+
+    reset_fixture();
+    warm_up_quiet();
+    const float hits[] = {0.04f, 0.1f, 0.45f, 0.8f};
+    for (unsigned hit = 0; hit < sizeof(hits) / sizeof(hits[0]); hit++) {
+        tones(hits[hit], 0, 0);
+        frames(1);
+        assert(!duty[1]);
+        frames(1);
+        assert(duty[1] == CFG_MAX_BRIGHT);
+        frames(2);
+        assert(duty[1] == CFG_MAX_BRIGHT);
+        quiet_noise();
+        frames(1);
+        assert(!duty[1]);
+    }
+    puts("PASS: bass hits at multiple volumes switch 0 -> cap -> 0 with no graduation");
+
+    reset_fixture();
+    warm_up_quiet();
+    tones(0, 0.1f, 0);
+    frames(60);
+    uint32_t voice_without_bass = duty[0];
+    tones(0.8f, 0.1f, 0);
+    frames(100);
+    assert(duty[1] == CFG_MAX_BRIGHT && s_reference_db == BASE_REFERENCE_DB);
+    assert(duty[0] >= voice_without_bass - 2 && duty[0] <= voice_without_bass + 2);
+    puts("PASS: loud bass cannot dim green through its voice-only normalizer");
+#endif
+#endif
 
     assert(i2s_mic_init() == ESP_OK);
     assert(rx_config.slot_cfg.data_bit_width == 32);
